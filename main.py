@@ -36,6 +36,7 @@ EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "http://localhost:8080")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "clave_secreta_para_tu_api_local")
 COLLECTION_NAME = "diseno_grafico_knowledge"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+ADMIN_PHONE = os.getenv("ADMIN_PHONE")
 
 # --- Inicialización de Base de Datos Local de Ventas ---
 def init_db():
@@ -394,8 +395,45 @@ def procesar_mensaje_ia(remote_jid: str, nombre_remitente: str, texto: str):
         
     enviar_mensaje_whatsapp(remote_jid, respuesta_final)
 
+def obtener_resumen_ventas_hoy() -> str:
+    """Consulta SQLite y devuelve un resumen formateado para WhatsApp."""
+    hoy_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        conn = sqlite3.connect("ventas.db")
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM ventas WHERE fecha LIKE ? ORDER BY id ASC", (f"{hoy_str}%",))
+        filas = cursor.fetchall()
+        columnas = [col[0] for col in cursor.description]
+        conn.close()
+
+        if not filas:
+            return f"📊 *Reporte del Día ({hoy_str})*\n\nNo se han registrado ventas el día de hoy."
+
+        col_cliente = next((c for c in columnas if c in ["nombre", "cliente", "nombre_cliente"]), columnas[1])
+        col_servicio = next((c for c in columnas if c in ["servicio", "producto", "item"]), columnas[2])
+        col_precio = next((c for c in columnas if c in ["precio", "monto", "total"]), columnas[3])
+
+        total_ventas = len(filas)
+        total_recaudado = sum(limpiar_monto(f[col_precio]) for f in filas)
+        anticipos = total_recaudado * 0.5
+
+        lineas = [f"📊 *REPORTE DIARIO DE VENTAS ({hoy_str})*\n"]
+        for idx, f in enumerate(filas, 1):
+            monto = limpiar_monto(f[col_precio])
+            lineas.append(f"{idx}. *{f[col_cliente]}* — {f[col_servicio]} (${monto:.2f})")
+
+        lineas.append("\n" + "—" * 20)
+        lineas.append(f"💼 *Total contratos:* {total_ventas}")
+        lineas.append(f"💵 *Monto proyectado:* ${total_recaudado:.2f} USD")
+        lineas.append(f"🏦 *Anticipos requeridos (50%):* ${anticipos:.2f} USD")
+
+        return "\n".join(lineas)
+    except Exception as e:
+        return f"❌ Error generando resumen: {e}"
 
 
+"""
 @app.post("/webhook")
 async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
     datos = await request.json()
@@ -407,6 +445,35 @@ async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
         background_tasks.add_task(procesar_mensaje_ia, remote_jid, nombre, texto)
 
     return {"status": "received"}
+"""
+
+@app.post("/webhook")
+async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
+    datos = await request.json()
+    remote_jid = datos.get("remoteJid", "")
+    nombre = datos.get("name", "Cliente")
+    texto = (datos.get("message") or "").strip()
+
+    if remote_jid and texto:
+        # Extraer identificador numérico
+        identificador = remote_jid.split("@")[0]
+
+        # --- COMANDOS EXCLUSIVOS DE ADMINISTRADOR ---
+        # Verifica si el remitente coincide con el admin y si solicita el reporte
+        es_admin = bool(ADMIN_PHONE and (ADMIN_PHONE in identificador or identificador in ADMIN_PHONE))
+        
+        if es_admin and texto.lower() in ["/reporte", "/ventas", "!reporte"]:
+            print(f"👑 Comando admin detectado desde {remote_jid}: {texto}")
+            reporte_texto = obtener_resumen_ventas_hoy()
+            # Se envía directo al socket sin pasar por Gemini
+            enviar_mensaje_whatsapp(remote_jid, reporte_texto)
+            return {"status": "received"}
+
+        # Flujo normal para clientes hacia Gemini / LangGraph
+        background_tasks.add_task(procesar_mensaje_ia, remote_jid, nombre, texto)
+
+    return {"status": "received"}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
