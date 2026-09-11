@@ -86,13 +86,22 @@ async function startWhatsApp() {
             console.log(`👤 Remitente: ${senderName} | Texto: "${text}"`);
 
             if (text.trim()) {
+                // 1. Activar animación de "escribiendo..." en WhatsApp
+                await sock.sendPresenceUpdate('composing', remoteJid);
                 console.log("🚀 Enviando mensaje a FastAPI (http://localhost:8000/webhook)...");
-                const response = await axios.post(PYTHON_WEBHOOK, {
-                    remoteJid: remoteJid,
-                    name: senderName,
-                    message: text
-                });
-                console.log(`📡 Respuesta de FastAPI: Código ${response.status}`);
+
+                try {
+                    const response = await axios.post(PYTHON_WEBHOOK, {
+                        remoteJid: remoteJid,
+                        name: senderName,
+                        message: text
+                    });
+                    console.log(`📡 Respuesta de FastAPI: Código ${response.status}`);
+                } catch (apiErr) {
+                    // Si FastAPI falla o está apagado, quitamos los tres puntos
+                    await sock.sendPresenceUpdate('paused', remoteJid);
+                    throw apiErr;
+                }
             } else {
                 console.log("⚠️ Mensaje recibido sin texto detectable (sticker, audio, etc.).");
             }
