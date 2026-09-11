@@ -65,3 +65,23 @@ env/
 
 # Logs
 *.log
+node_modules
+/node_modules
+
+# WhatsApp Bridge
+whatsapp_bridge/node_modules/
+whatsapp_bridge/auth_info_baileys/
+
+# Python y entorno
+__pycache__/
+*.pyc
+.env
+ventas.db
+
+# Qdrant local
+qdrant_storage/
+
+# Bases de datos locales y archivos temporales WAL
+*.db
+*.db-shm
+*.db-wal

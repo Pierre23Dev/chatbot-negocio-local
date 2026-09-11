@@ -8,3 +8,8 @@ langchain-qdrant>=0.1.0
 qdrant-client>=1.9.0
 requests>=2.31.0
 python-dotenv>=1.0.0
+fastembed
+langchain-qdrant
+langchain-huggingface
+sentence-transformers
+langgraph-checkpoint-sqlite
