@@ -277,6 +277,116 @@ memory_conn = sqlite3.connect("conversations.db", check_same_thread=False)
 checkpointer = SqliteSaver(memory_conn)
 graph = workflow.compile(checkpointer=checkpointer)
 
+# discord reporte
+
+def limpiar_monto(valor) -> float:
+    """Extrae el número decimal de cadenas como '$30.00 USD', '30$', etc."""
+    if valor is None:
+        return 0.0
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    # Extrae solo dígitos y el punto decimal
+    coincidencias = re.findall(r"[-+]?\d*\.\d+|\d+", str(valor).replace(",", "."))
+    return float(coincidencias[0]) if coincidencias else 0.0
+
+
+def enviar_reporte_diario_discord():
+    """Genera el reporte de ventas del día, métricas y lo envía con el CSV adjunto a Discord."""
+    if not DISCORD_WEBHOOK_URL:
+        print("⚠️ DISCORD_WEBHOOK_URL no configurado para el reporte diario.")
+        return
+
+    hoy_str = datetime.now().strftime("%Y-%m-%d")
+    archivo_csv = f"reporte_ventas_{hoy_str}.csv"
+
+    try:
+        conn = sqlite3.connect("ventas.db")
+        conn.row_factory = sqlite3.Row  # Permite acceder a las columnas por nombre como diccionario
+        cursor = conn.cursor()
+
+        # Filtrar registros del día actual
+        cursor.execute("SELECT * FROM ventas WHERE fecha LIKE ? ORDER BY id ASC", (f"{hoy_str}%",))
+        filas = cursor.fetchall()
+        
+        # Obtener nombres de columnas dinámicamente
+        columnas = [col[0] for col in cursor.description]
+        conn.close()
+
+        total_ventas = len(filas)
+
+        if total_ventas == 0:
+            payload = {
+                "username": "Cierre Diario de Ventas",
+                "embeds": [{
+                    "title": f"📊 Cierre Diario — {hoy_str}",
+                    "description": "Hoy no se registraron nuevas ventas confirmadas.",
+                    "color": 9807270,  # Gris
+                    "footer": {"text": "WhatsApp AI Gateway | Reporte Automático"}
+                }]
+            }
+            requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+            print("📊 Reporte diario enviado a Discord (0 ventas).")
+            return
+
+        # Escribir el CSV oficial
+        with open(archivo_csv, mode="w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(columnas)
+            for fila in filas:
+                writer.writerow([fila[col] for col in columnas])
+
+        # Detectar columnas de cliente, servicio y precio dinámicamente
+        col_cliente = next((c for c in columnas if c in ["nombre", "cliente", "nombre_cliente"]), columnas[1])
+        col_servicio = next((c for c in columnas if c in ["servicio", "producto", "item"]), columnas[2])
+        col_precio = next((c for c in columnas if c in ["precio", "monto", "total"]), columnas[3])
+
+        # Limpieza segura de montos
+        total_recaudado = sum(limpiar_monto(fila[col_precio]) for fila in filas)
+
+        # Generar lista de resumen para el Embed
+        resumen_items = "\n".join([
+            f"• **{fila[col_cliente]}**: {fila[col_servicio]} (${limpiar_monto(fila[col_precio]):.2f})" 
+            for fila in filas[:10]
+        ])
+        if total_ventas > 10:
+            resumen_items += f"\n*... y {total_ventas - 10} más en el archivo adjunto.*"
+
+        embed = {
+            "title": f"📊 Cierre de Ventas Diario — {hoy_str}",
+            "description": f"Resumen consolidado a las 20:00:\n\n{resumen_items}",
+            "color": 3066993,  # Verde
+            "fields": [
+                {"name": "💼 Total Contratos", "value": str(total_ventas), "inline": True},
+                {"name": "💵 Monto Proyectado", "value": f"${total_recaudado:.2f} USD", "inline": True},
+                {"name": "🏦 Anticipos (50%)", "value": f"${(total_recaudado * 0.5):.2f} USD", "inline": True}
+            ],
+            "footer": {"text": "WhatsApp AI Gateway | Adjunto: CSV oficial del día"}
+        }
+
+        # Enviar Embed + CSV adjunto a Discord
+        with open(archivo_csv, "rb") as f:
+            files = {"file": (archivo_csv, f, "text/csv")}
+            data = {
+                "payload_json": json.dumps({
+                    "username": "Cierre Diario de Ventas",
+                    "embeds": [embed]
+                })
+            }
+            res = requests.post(DISCORD_WEBHOOK_URL, data=data, files=files, timeout=15)
+            if res.status_code in [200, 204]:
+                print(f"✅ Reporte diario y CSV enviados a Discord con éxito ({total_ventas} ventas).")
+            else:
+                print(f"❌ Error al enviar reporte a Discord: {res.text}")
+
+        # Eliminar CSV temporal local
+        if os.path.exists(archivo_csv):
+            os.remove(archivo_csv)
+
+    except Exception as e:
+        print(f"❌ Error generando reporte diario: {e}")
+
+
+
 # --- Servidor FastAPI ---
 scheduler = BackgroundScheduler()
 
