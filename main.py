@@ -4,6 +4,8 @@ import requests
 import csv
 import re
 import json
+import asyncio
+import threading
 from datetime import datetime
 from typing import Annotated, Literal
 from dotenv import load_dotenv
@@ -43,10 +45,15 @@ ADMIN_PHONE = os.getenv("ADMIN_PHONE")
 COLLECTION_KNOWLEDGE = "diseno_grafico_knowledge"
 COLLECTION_CLIENTS = "clientes_memoria"
 
-# --- Inicialización de SQLite ---
+# --- Control de Concurrencia para Gemini ---
+gemini_semaphore = asyncio.Semaphore(5)
+
+# --- Inicialización de SQLite con Modo WAL ---
 def init_db():
-    conn = sqlite3.connect("ventas.db")
+    conn = sqlite3.connect("ventas.db", timeout=15)
     cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA busy_timeout=5000;")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS ventas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,9 +148,9 @@ llm_resumen = ChatGoogleGenerativeAI(
 )
 
 def extraer_y_guardar_hechos_cliente(telefono: str, nombre: str, texto_cliente: str, respuesta_bot: str):
-    """Analiza la interacción con Gemini y guarda datos clave del cliente en Qdrant."""
-    prompt = f"""Eres un analista de datos comerciales. Analiza esta interacción reciente de WhatsApp y extrae información CLAVE sobre el cliente en 1 frase concisa (por ejemplo: rubro de su negocio, preferencias visuales, requerimientos especiales, presupuesto mencionado).
-Si el mensaje solo contiene saludos, despedidas o preguntas genéricas sin información sobre el cliente, responde únicamente la palabra: DESCARTAR.
+    """Ejecuta la extracción de datos clave en un hilo desacoplado del servidor."""
+    prompt = f"""Eres un analista de datos comerciales. Analiza esta interacción reciente de WhatsApp y extrae información CLAVE sobre el cliente en 1 frase concisa (rubro del negocio, preferencias visuales, requerimientos especiales, presupuesto mencionado).
+Si el mensaje solo contiene saludos, despedidas o preguntas genéricas sin datos sobre el perfil del cliente, responde únicamente la palabra: DESCARTAR.
 
 Cliente ({nombre}): {texto_cliente}
 Bot: {respuesta_bot}
@@ -167,8 +174,7 @@ Hecho clave extraído:"""
     except Exception as e:
         print(f"Error al sintetizar o guardar memoria de cliente: {e}")
 
-
-# --- Herramientas del Agente (Tools) ---
+# --- Herramientas del Agente ---
 
 @tool
 def consultar_servicios_y_politicas(consulta: str) -> str:
@@ -185,7 +191,8 @@ def registrar_venta_cerrada(nombre_cliente: str, telefono: str, servicio: str, m
     fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     try:
-        conn = sqlite3.connect("ventas.db")
+        conn = sqlite3.connect("ventas.db", timeout=15)
+        conn.execute("PRAGMA busy_timeout=5000;")
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO ventas (fecha, nombre_cliente, telefono, servicio, monto, estado) VALUES (?, ?, ?, ?, ?, ?)",
@@ -244,7 +251,7 @@ REGLAS DE OPERACIÓN:
 """)
 
 def call_model(state: AgentState):
-    # PODA DE MENSAJES (Ahorro de tokens): conservamos solo los últimos 6 intercambios
+    # Poda: solo los últimos 6 mensajes van al modelo
     mensajes_recientes = state["messages"][-6:]
     messages = [SYSTEM_PROMPT] + mensajes_recientes
     response = llm.invoke(messages)
@@ -273,25 +280,24 @@ workflow.add_edge(START, "agent")
 workflow.add_conditional_edges("agent", route_after_model, {"tools": "tools", "__end__": END})
 workflow.add_edge("tools", "agent")
 
-memory_conn = sqlite3.connect("conversations.db", check_same_thread=False)
+# Memoria SQLite con WAL y busy_timeout configurado
+memory_conn = sqlite3.connect("conversations.db", check_same_thread=False, timeout=15)
+memory_conn.execute("PRAGMA journal_mode=WAL;")
+memory_conn.execute("PRAGMA busy_timeout=5000;")
 checkpointer = SqliteSaver(memory_conn)
 graph = workflow.compile(checkpointer=checkpointer)
 
-# discord reporte
+# --- Reporte Diario Discord ---
 
 def limpiar_monto(valor) -> float:
-    """Extrae el número decimal de cadenas como '$30.00 USD', '30$', etc."""
     if valor is None:
         return 0.0
     if isinstance(valor, (int, float)):
         return float(valor)
-    # Extrae solo dígitos y el punto decimal
     coincidencias = re.findall(r"[-+]?\d*\.\d+|\d+", str(valor).replace(",", "."))
     return float(coincidencias[0]) if coincidencias else 0.0
 
-
 def enviar_reporte_diario_discord():
-    """Genera el reporte de ventas del día, métricas y lo envía con el CSV adjunto a Discord."""
     if not DISCORD_WEBHOOK_URL:
         print("⚠️ DISCORD_WEBHOOK_URL no configurado para el reporte diario.")
         return
@@ -300,27 +306,22 @@ def enviar_reporte_diario_discord():
     archivo_csv = f"reporte_ventas_{hoy_str}.csv"
 
     try:
-        conn = sqlite3.connect("ventas.db")
-        conn.row_factory = sqlite3.Row  # Permite acceder a las columnas por nombre como diccionario
+        conn = sqlite3.connect("ventas.db", timeout=15)
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-
-        # Filtrar registros del día actual
         cursor.execute("SELECT * FROM ventas WHERE fecha LIKE ? ORDER BY id ASC", (f"{hoy_str}%",))
         filas = cursor.fetchall()
-        
-        # Obtener nombres de columnas dinámicamente
         columnas = [col[0] for col in cursor.description]
         conn.close()
 
         total_ventas = len(filas)
-
         if total_ventas == 0:
             payload = {
                 "username": "Cierre Diario de Ventas",
                 "embeds": [{
                     "title": f"📊 Cierre Diario — {hoy_str}",
                     "description": "Hoy no se registraron nuevas ventas confirmadas.",
-                    "color": 9807270,  # Gris
+                    "color": 9807270,
                     "footer": {"text": "WhatsApp AI Gateway | Reporte Automático"}
                 }]
             }
@@ -328,22 +329,18 @@ def enviar_reporte_diario_discord():
             print("📊 Reporte diario enviado a Discord (0 ventas).")
             return
 
-        # Escribir el CSV oficial
         with open(archivo_csv, mode="w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow(columnas)
             for fila in filas:
                 writer.writerow([fila[col] for col in columnas])
 
-        # Detectar columnas de cliente, servicio y precio dinámicamente
         col_cliente = next((c for c in columnas if c in ["nombre", "cliente", "nombre_cliente"]), columnas[1])
         col_servicio = next((c for c in columnas if c in ["servicio", "producto", "item"]), columnas[2])
         col_precio = next((c for c in columnas if c in ["precio", "monto", "total"]), columnas[3])
 
-        # Limpieza segura de montos
         total_recaudado = sum(limpiar_monto(fila[col_precio]) for fila in filas)
 
-        # Generar lista de resumen para el Embed
         resumen_items = "\n".join([
             f"• **{fila[col_cliente]}**: {fila[col_servicio]} (${limpiar_monto(fila[col_precio]):.2f})" 
             for fila in filas[:10]
@@ -354,7 +351,7 @@ def enviar_reporte_diario_discord():
         embed = {
             "title": f"📊 Cierre de Ventas Diario — {hoy_str}",
             "description": f"Resumen consolidado a las 20:00:\n\n{resumen_items}",
-            "color": 3066993,  # Verde
+            "color": 3066993,
             "fields": [
                 {"name": "💼 Total Contratos", "value": str(total_ventas), "inline": True},
                 {"name": "💵 Monto Proyectado", "value": f"${total_recaudado:.2f} USD", "inline": True},
@@ -363,42 +360,27 @@ def enviar_reporte_diario_discord():
             "footer": {"text": "WhatsApp AI Gateway | Adjunto: CSV oficial del día"}
         }
 
-        # Enviar Embed + CSV adjunto a Discord
         with open(archivo_csv, "rb") as f:
             files = {"file": (archivo_csv, f, "text/csv")}
-            data = {
-                "payload_json": json.dumps({
-                    "username": "Cierre Diario de Ventas",
-                    "embeds": [embed]
-                })
-            }
+            data = {"payload_json": json.dumps({"username": "Cierre Diario de Ventas", "embeds": [embed]})}
             res = requests.post(DISCORD_WEBHOOK_URL, data=data, files=files, timeout=15)
             if res.status_code in [200, 204]:
                 print(f"✅ Reporte diario y CSV enviados a Discord con éxito ({total_ventas} ventas).")
             else:
                 print(f"❌ Error al enviar reporte a Discord: {res.text}")
 
-        # Eliminar CSV temporal local
         if os.path.exists(archivo_csv):
             os.remove(archivo_csv)
 
     except Exception as e:
         print(f"❌ Error generando reporte diario: {e}")
 
-
-
 # --- Servidor FastAPI ---
 scheduler = BackgroundScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Programar todos los días a las 20:00 (8 PM)
-    scheduler.add_job(
-        enviar_reporte_diario_discord,
-        trigger="cron",
-        hour=20,
-        minute=0
-    )
+    scheduler.add_job(enviar_reporte_diario_discord, trigger="cron", hour=20, minute=0)
     scheduler.start()
     yield
     scheduler.shutdown()
@@ -412,23 +394,24 @@ def enviar_mensaje_whatsapp(remote_jid: str, mensaje: str):
     except Exception as e:
         print(f"Error al enviar mensaje vía WhatsApp Gateway: {e}")
 
-def procesar_mensaje_ia(remote_jid: str, nombre_remitente: str, texto: str, background_tasks: BackgroundTasks):
+async def procesar_mensaje_ia(remote_jid: str, nombre_remitente: str, texto: str):
     telefono = remote_jid.replace("@s.whatsapp.net", "").replace("@lid", "")
     config = {"configurable": {"thread_id": telefono}}
     
-    # 1. Recuperar memoria episódica del cliente desde Qdrant
     antecedentes = recuperar_memoria_cliente(telefono, texto)
     
-    # 2. Inyectar antecedentes de forma compacta
     prompt_usuario = (
         f"[Antecedentes del cliente en sistema: {antecedentes}]\n"
         f"[Cliente: {nombre_remitente}, Tel: {telefono}]: {texto}"
     )
     
-    output = graph.invoke(
-        {"messages": [HumanMessage(content=prompt_usuario)]},
-        config=config
-    )
+    # Restringe a 5 llamadas simultáneas hacia la API de Google
+    async with gemini_semaphore:
+        output = await asyncio.to_thread(
+            graph.invoke,
+            {"messages": [HumanMessage(content=prompt_usuario)]},
+            config=config
+        )
     
     raw_content = output["messages"][-1].content
     if isinstance(raw_content, list):
@@ -436,17 +419,14 @@ def procesar_mensaje_ia(remote_jid: str, nombre_remitente: str, texto: str, back
     else:
         respuesta_final = str(raw_content)
         
-    # 3. Enviar respuesta por WhatsApp
     enviar_mensaje_whatsapp(remote_jid, respuesta_final)
     
-    # 4. Tarea asíncrona: sintetizar y guardar memoria sin bloquear el chat
-    background_tasks.add_task(
-        extraer_y_guardar_hechos_cliente,
-        telefono=telefono,
-        nombre=nombre_remitente,
-        texto_cliente=texto,
-        respuesta_bot=respuesta_final
-    )
+    # Hilo daemon desacoplado para extraer y guardar la memoria del cliente
+    threading.Thread(
+        target=extraer_y_guardar_hechos_cliente,
+        args=(telefono, nombre_remitente, texto, respuesta_final),
+        daemon=True
+    ).start()
 
 @app.post("/webhook")
 async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -460,8 +440,7 @@ async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
             procesar_mensaje_ia, 
             remote_jid, 
             nombre, 
-            texto, 
-            background_tasks
+            texto
         )
 
     return {"status": "received"}
