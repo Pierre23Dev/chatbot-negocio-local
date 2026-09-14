@@ -44,10 +44,22 @@ def indexar_documentos():
 
     # 3. Configuración del modelo multilingual-e5-small en float16
     print("Cargando modelo local multilingual-e5-small (float16)...")
+    """Este script se ejecutara en CPU y En procesadores CPU, PyTorch no soporta operaciones 
+    matemáticas en float16 (Half Precision) y lanzará un error tipo 
+    RuntimeError: "addmm_impl_cpu_" not implemented for 'Half'. En CPU, el modelo debe correr en float32 (estándar),
+     lo cual no es problema porque multilingual-e5-small pesa apenas ~470 MB y consume muy poca memoria.
     model_kwargs = {
         "torch_dtype": torch.float16,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
     }
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    model_kwargs = {"device": device}
+    # torch_dtype debe ir dentro de 'model_kwargs' anidado y solo si hay GPU
+    if device == "cuda":
+        model_kwargs["model_kwargs"] = {"torch_dtype": torch.float16}
+
     encode_kwargs = {
         "normalize_embeddings": True  # Normalización coseno requerida para modelos E5
     }
@@ -57,6 +69,7 @@ def indexar_documentos():
         model_kwargs=model_kwargs,
         encode_kwargs=encode_kwargs,
     )
+
 
     client = QdrantClient(url=QDRANT_URL)
 
