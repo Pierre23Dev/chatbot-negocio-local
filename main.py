@@ -155,6 +155,22 @@ def limpiar_monto(valor) -> float:
 
 
 
+def sanitizar_mensajes_para_gemini(messages: list) -> list:
+        """Sanea el historial recortado para que no contenga ToolMessages huérfanos
+        ni rompa el orden de turnos exigido por la API de Gemini."""
+        if not messages:
+            return []
+
+        recientes = list(messages[-8:])
+
+        # Eliminar ToolMessages u AIMessages huérfanos al inicio del recorte
+        while recientes and not isinstance(recientes[0], HumanMessage):
+            recientes.pop(0)
+
+        return recientes if recientes else messages[-1:]
+
+
+
 async def notificar_venta_discord(nombre: str, telefono: str, servicio: str, monto: float):
     """Envía un Embed enriquecido al canal de Discord vía Webhook."""
     if not DISCORD_WEBHOOK_URL:
@@ -346,7 +362,7 @@ REGLAS DE OPERACIÓN:
 # 4. Nodos de LangGraph
 async def call_model(state: AgentState):
     # Conservamos solo los últimos 8 mensajes del hilo activo
-    mensajes_recientes = state["messages"][-8:]
+    mensajes_recientes = sanitizar_mensajes_para_gemini(state["messages"])
 
     # Si tienes contexto recuperado de la memoria del cliente, se agrega aquí
     messages = [SYSTEM_PROMPT] + mensajes_recientes
