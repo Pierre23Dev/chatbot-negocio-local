@@ -79,14 +79,15 @@ async def init_db():
 http_client: httpx.AsyncClient = None
 
 # --- Conexión RAG Local con multilingual-e5-small (float16) ---
+# esto funcionara en CPU y no se puede usar precision numerica de 16
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model_kwargs = {
-    "torch_dtype": torch.float16,
-    "device_map": device,
-}
+model_kwargs = {"device": device}
+
+if device == "cuda":
+    model_kwargs["model_kwargs"] = {"torch_dtype": torch.float16}
 
 encode_kwargs = {
-    "normalize_embeddings": True  # Crucial para la precisión de búsqueda con E5
+    "normalize_embeddings": True
 }
 
 embeddings = HuggingFaceEmbeddings(
@@ -94,6 +95,7 @@ embeddings = HuggingFaceEmbeddings(
     model_kwargs=model_kwargs,
     encode_kwargs=encode_kwargs,
 )
+
 
 client_qdrant = AsyncQdrantClient(url=QDRANT_URL)
 
