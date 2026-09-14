@@ -112,6 +112,31 @@ vectorstore_clientes = QdrantVectorStore(
     embedding=embeddings
 )
 
+
+def notificar_venta_discord(nombre: str, telefono: str, servicio: str, monto: float):
+    """Envía un Embed enriquecido al canal de Discord vía Webhook."""
+    if not DISCORD_WEBHOOK_URL:
+        print("⚠️ Advertencia: DISCORD_WEBHOOK_URL no configurado.")
+        return
+
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    embed = {
+        "title": "🎉 ¡Nueva Venta Registrada!",
+        "description": "Se ha cerrado un pedido desde el bot de WhatsApp.",
+        "color": 3066993,  # Código hexadecimal en decimal (Verde #2ECC71)
+        "fields": [
+            {"name": "👤 Cliente", "value": nombre, "inline": True},
+            {"name": "📱 Teléfono / JID", "value": telefono, "inline": True},
+            {"name": "💼 Servicio Contratado", "value": servicio, "inline": False},
+            {"name": "💵 Monto Acordado", "value": f"${monto:.2f} USD", "inline": True},
+            {"name": "⏳ Estado", "value": "Pendiente Confirmación Anticipo (50%)", "inline": True},
+        ],
+        "footer": {
+            "text": f"Registrado el {ahora} | WhatsApp AI Gateway"
+        }
+    }
+
 # --- Funciones de Memoria RAG de Clientes ---
 
 def recuperar_memoria_cliente(telefono: str, consulta_actual: str) -> str:
@@ -428,6 +453,45 @@ async def procesar_mensaje_ia(remote_jid: str, nombre_remitente: str, texto: str
         daemon=True
     ).start()
 
+
+def obtener_resumen_ventas_hoy() -> str:
+    """Consulta SQLite y devuelve un resumen formateado para WhatsApp."""
+    hoy_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        conn = sqlite3.connect("ventas.db")
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM ventas WHERE fecha LIKE ? ORDER BY id ASC", (f"{hoy_str}%",))
+        filas = cursor.fetchall()
+        columnas = [col[0] for col in cursor.description]
+        conn.close()
+
+        if not filas:
+            return f"📊 *Reporte del Día ({hoy_str})*\n\nNo se han registrado ventas el día de hoy."
+
+        col_cliente = next((c for c in columnas if c in ["nombre", "cliente", "nombre_cliente"]), columnas[1])
+        col_servicio = next((c for c in columnas if c in ["servicio", "producto", "item"]), columnas[2])
+        col_precio = next((c for c in columnas if c in ["precio", "monto", "total"]), columnas[3])
+
+        total_ventas = len(filas)
+        total_recaudado = sum(limpiar_monto(f[col_precio]) for f in filas)
+        anticipos = total_recaudado * 0.5
+
+        lineas = [f"📊 *REPORTE DIARIO DE VENTAS ({hoy_str})*\n"]
+        for idx, f in enumerate(filas, 1):
+            monto = limpiar_monto(f[col_precio])
+            lineas.append(f"{idx}. *{f[col_cliente]}* — {f[col_servicio]} (${monto:.2f})")
+
+        lineas.append("\n" + "—" * 20)
+        lineas.append(f"💼 *Total contratos:* {total_ventas}")
+        lineas.append(f"💵 *Monto proyectado:* ${total_recaudado:.2f} USD")
+        lineas.append(f"🏦 *Anticipos requeridos (50%):* ${anticipos:.2f} USD")
+
+        return "\n".join(lineas)
+    except Exception as e:
+        return f"❌ Error generando resumen: {e}"
+
+
 @app.post("/webhook")
 async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
     datos = await request.json()
@@ -436,6 +500,21 @@ async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
     texto = (datos.get("message") or "").strip()
 
     if remote_jid and texto:
+        # Extraer identificador numérico
+        identificador = remote_jid.split("@")[0]
+
+        # --- COMANDOS EXCLUSIVOS DE ADMINISTRADOR ---
+        # Verifica si el remitente coincide con el admin y si solicita el reporte
+        es_admin = bool(ADMIN_PHONE and (ADMIN_PHONE in identificador or identificador in ADMIN_PHONE))
+
+        if es_admin and texto.lower() in ["/reporte", "/ventas", "!reporte"]:
+            print(f"👑 Comando admin detectado desde {remote_jid}: {texto}")
+            reporte_texto = obtener_resumen_ventas_hoy()
+            # Se envía directo al socket sin pasar por Gemini
+            enviar_mensaje_whatsapp(remote_jid, reporte_texto)
+            return {"status": "received"}
+
+        # Flujo normal para clientes hacia Gemini / LangGraph
         background_tasks.add_task(
             procesar_mensaje_ia, 
             remote_jid, 
