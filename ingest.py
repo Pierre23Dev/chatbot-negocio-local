@@ -83,7 +83,8 @@ def indexar_documentos():
         vectors_config=VectorParams(size=384, distance=Distance.COSINE),
     )
 
-    # 5. Indexación en Qdrant
+    """
+    # 5. Indexación en Qdrant - ESto no funciono
     QdrantVectorStore.from_documents(
         documents=chunks,
         embedding=embeddings,
@@ -91,6 +92,17 @@ def indexar_documentos():
         collection_name=COLLECTION_NAME,
     )
     print("✅ ¡Base vectorial indexada correctamente con prefijos 'passage:' y float16!")
+    """
+
+    # 5. Indexación en Qdrant (Instanciación directa + add_documents)
+    vector_store = QdrantVectorStore(
+        client=client,
+        collection_name=COLLECTION_NAME,
+        embedding=embeddings,
+    )
+    vector_store.add_documents(chunks)
+
+    print("✅ ¡Base vectorial indexada correctamente con prefijos 'passage:'!")
 
 if __name__ == "__main__":
     indexar_documentos()
