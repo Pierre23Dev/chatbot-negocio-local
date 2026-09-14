@@ -318,7 +318,11 @@ REGLAS DE OPERACIÓN:
 
 # 4. Nodos de LangGraph
 def call_model(state: AgentState):
-    messages = [SYSTEM_PROMPT] + state["messages"]
+    # Conservamos solo los últimos 8 mensajes del hilo activo
+    mensajes_recientes = state["messages"][-8:]
+
+    # Si tienes contexto recuperado de la memoria del cliente, se agrega aquí
+    messages = [SYSTEM_PROMPT] + mensajes_recientes
     response = router_llm.invoke(messages)
     return {"messages": [response]}
 
@@ -353,8 +357,10 @@ workflow.add_edge(START, "agent")
 workflow.add_conditional_edges("agent", route_after_model, {"tools": "tools", "__end__": END})
 workflow.add_edge("tools", "agent")
 
-# Memoria de conversación persistente por chat (SQLite)
-memory_conn = sqlite3.connect("conversations.db", check_same_thread=False)
+# Memoria SQLite con WAL y busy_timeout configurado
+memory_conn = sqlite3.connect("conversations.db", check_same_thread=False, timeout=15)
+memory_conn.execute("PRAGMA journal_mode=WAL;")
+memory_conn.execute("PRAGMA busy_timeout=5000;")
 checkpointer = SqliteSaver(memory_conn)
 graph = workflow.compile(checkpointer=checkpointer)
 
