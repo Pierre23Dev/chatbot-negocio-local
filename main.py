@@ -222,10 +222,10 @@ async def recuperar_memoria_cliente(telefono: str, consulta_actual: str) -> str:
 
 # Instancia ligera de Gemini dedicada solo a extraer hechos/resúmenes
 llm_resumen = ChatGoogleGenerativeAI(
-    model="gemma-4-26b-a4b-it",
+    model="gemini-3.5-flash-lite",
     google_api_key=GOOGLE_API_KEY,
     temperature=0.0,
-    request_timeout=5,
+    request_timeout=12,
     max_retries=1
 )
 
@@ -307,7 +307,7 @@ llm_gemini = ChatGoogleGenerativeAI(
     model="gemini-3.1-flash-lite",
     google_api_key=GOOGLE_API_KEY,
     temperature=0.2,
-    request_timeout=8,
+    request_timeout=10,
     max_retries=1
 )
 
@@ -316,7 +316,7 @@ llm_gemini_fallback = ChatGoogleGenerativeAI(
     model="gemini-3.5-flash-lite",
     google_api_key=GOOGLE_API_KEY,
     temperature=0.2,
-    request_timeout=8,
+    request_timeout=10,
     max_retries=1
 )
 
