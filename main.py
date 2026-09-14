@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from dotenv import load_dotenv
 
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from fastapi import FastAPI, Request, BackgroundTasks
 import uvicorn
 import torch
@@ -42,6 +43,8 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "http://localhost:8080")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "clave_secreta_para_tu_api_local")
 ADMIN_PHONE = os.getenv("ADMIN_PHONE")
+# 1. Asegúrate de cargar tu clave real del entorno (sin el símbolo '$' de bash)
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 
 COLLECTION_KNOWLEDGE = "diseno_grafico_knowledge"
 COLLECTION_CLIENTS = "clientes_memoria"
@@ -179,7 +182,7 @@ def recuperar_memoria_cliente(telefono: str, consulta_actual: str) -> str:
 
 # Instancia ligera de Gemini dedicada solo a extraer hechos/resúmenes
 llm_resumen = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+    model="gemma-4-26b-a4b-it",
     google_api_key=GOOGLE_API_KEY,
     temperature=0.0
 )
@@ -272,13 +275,33 @@ def registrar_venta_cerrada(nombre_cliente: str, telefono: str, servicio: str, m
 tools = [consultar_servicios_y_politicas, registrar_venta_cerrada]
 tools_by_name = {t.name: t for t in tools}
 
-llm = ChatGoogleGenerativeAI(
+# --- Inicialización del Modelo Gemini ---
+llm_gemini = ChatGoogleGenerativeAI(
     model="gemini-3.1-flash-lite",
     google_api_key=GOOGLE_API_KEY,
     temperature=0.2
-).bind_tools(tools)
+    request_timeout=8,
+    max_retries=1
+)
 
-# --- Construcción del Grafo LangGraph con Poda de Historial ---
+# 2. Inicializamos el cliente
+llm_gemini_fallback = ChatGoogleGenerativeAI(
+    model="gemini-3.5-flash-lite",
+    google_api_key=GOOGLE_API_KEY,
+    temperature=0.2,
+    request_timeout=8,
+    max_retries=1
+)
+
+# 3. Equipar herramientas a cada LLM y construir la cascada
+gemini_con_tools = llm_gemini.bind_tools(tools)
+fallback_con_tools = llm_gemini_fallback.bind_tools(tools)
+
+# Este es el objeto final que pasarás directamente a tus nodos de LangGraph
+router_llm = gemini_con_tools.with_fallbacks(
+    [fallback_con_tools],
+    exceptions_to_handle=(Exception,)
+)
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
@@ -292,31 +315,40 @@ REGLAS DE OPERACIÓN:
 4. Respuestas concisas, comerciales y directas, óptimas para WhatsApp.
 """)
 
+
+# 4. Nodos de LangGraph
 def call_model(state: AgentState):
     # Conservamos solo los últimos 8 mensajes del hilo activo
     mensajes_recientes = state["messages"][-8:]
 
     # Si tienes contexto recuperado de la memoria del cliente, se agrega aquí
     messages = [SYSTEM_PROMPT] + mensajes_recientes
-    response = llm.invoke(messages)
+    response = router_llm.invoke(messages)
     return {"messages": [response]}
 
 
 def call_tools(state: AgentState):
     last_message = state["messages"][-1]
+    
+    if not getattr(last_message, "tool_calls", None):
+        return {"messages": []}
+        
     results = []
     for tool_call in last_message.tool_calls:
         tool_fn = tools_by_name[tool_call["name"]]
         output = tool_fn.invoke(tool_call["args"])
         results.append(ToolMessage(content=str(output), tool_call_id=tool_call["id"]))
+        
     return {"messages": results}
 
 def route_after_model(state: AgentState) -> Literal["tools", "__end__"]:
     last_message = state["messages"][-1]
-    if getattr(last_message, "tool_calls", None):
+    if getattr(last_message, "tool_calls", None) and len(last_message.tool_calls) > 0:
         return "tools"
     return "__end__"
 
+
+# 5. Compilación del Workflow
 workflow = StateGraph(AgentState)
 workflow.add_node("agent", call_model)
 workflow.add_node("tools", call_tools)
