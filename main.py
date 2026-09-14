@@ -1,4 +1,5 @@
 import os
+import torch
 import sqlite3
 import requests
 import csv
@@ -70,17 +71,20 @@ def init_db():
 
 init_db()
 
-# --- Configuración de Embeddings con multilingual-e5-small (float16) ---
+# --- Conexión RAG Local con multilingual-e5-small (float16) ---
 model_kwargs = {
     "torch_dtype": torch.float16,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
 }
-encode_kwargs = {"normalize_embeddings": True}
+
+encode_kwargs = {
+    "normalize_embeddings": True  # Crucial para la precisión de búsqueda con E5
+}
 
 embeddings = HuggingFaceEmbeddings(
     model_name="intfloat/multilingual-e5-small",
     model_kwargs=model_kwargs,
-    encode_kwargs=encode_kwargs
+    encode_kwargs=encode_kwargs,
 )
 
 client_qdrant = QdrantClient(url=QDRANT_URL)
@@ -108,8 +112,16 @@ if not client_qdrant.collection_exists(COLLECTION_CLIENTS):
 
 vectorstore_clientes = QdrantVectorStore(
     client=client_qdrant,
-    collection_name=COLLECTION_CLIENTS,
-    embedding=embeddings
+    collection_name=COLLECTION_NAME,
+    embedding=embeddings,
+)
+
+retriever = vectorstore.as_retriever(
+    search_type="similarity_score_threshold",
+    search_kwargs={
+        "k": 3,                    # Límite máximo de fragmentos
+        "score_threshold": 0.75    # Solo devuelve fragmentos con similitud >= 75%
+    }
 )
 
 
@@ -204,11 +216,16 @@ Hecho clave extraído:"""
 @tool
 def consultar_servicios_y_politicas(consulta: str) -> str:
     """Consulta la base de conocimientos sobre precios, servicios, tiempos de entrega y políticas del negocio de diseño gráfico."""
+    # E5 requiere obligatoriamente el prefijo 'query: ' para recuperar información
     consulta_formateada = f"query: {consulta.strip()}"
-    docs = retriever_knowledge.invoke(consulta_formateada)
+    docs = retriever.invoke(consulta_formateada)
     if not docs:
         return "No se encontró información específica en los documentos del negocio."
-    return "\n\n".join([d.page_content.replace("passage: ", "") for d in docs])
+    # Unir fragmentos con separación clara
+    contenido = "\n\n---\n\n".join([d.page_content.replace("passage: ", "") for d in docs])
+    
+    # Límite estricto de seguridad (ej. 2000 caracteres)
+    return contenido[:2000]
 
 @tool
 def registrar_venta_cerrada(nombre_cliente: str, telefono: str, servicio: str, monto: str) -> str:
@@ -276,11 +293,14 @@ REGLAS DE OPERACIÓN:
 """)
 
 def call_model(state: AgentState):
-    # Poda: solo los últimos 6 mensajes van al modelo
-    mensajes_recientes = state["messages"][-6:]
+    # Conservamos solo los últimos 8 mensajes del hilo activo
+    mensajes_recientes = state["messages"][-8:]
+
+    # Si tienes contexto recuperado de la memoria del cliente, se agrega aquí
     messages = [SYSTEM_PROMPT] + mensajes_recientes
     response = llm.invoke(messages)
     return {"messages": [response]}
+
 
 def call_tools(state: AgentState):
     last_message = state["messages"][-1]
