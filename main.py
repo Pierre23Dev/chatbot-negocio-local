@@ -9,7 +9,8 @@ import json
 import asyncio
 import threading
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Optional
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -537,21 +538,61 @@ async def enviar_mensaje_whatsapp(remote_jid: str, mensaje: str):
         print(f"❌ Error de conexión con WhatsApp Gateway: {e}")
 
 
-async def procesar_mensaje_ia(remote_jid: str, nombre_remitente: str, texto: str):
+class WebhookPayload(BaseModel):
+    remoteJid: str
+    name: str = "Cliente"
+    messageType: str = "text"
+    message: Optional[str] = ""
+    mediaBase64: Optional[str] = None
+    mimeType: Optional[str] = None
+
+
+async def procesar_mensaje_ia(
+    remote_jid: str, 
+    nombre_remitente: str, 
+    texto: str,
+    message_type: str = "text",
+    media_base64: Optional[str] = None,
+    mime_type: Optional[str] = None
+):
     telefono = remote_jid.replace("@s.whatsapp.net", "").replace("@lid", "")
     config = {"configurable": {"thread_id": telefono}}
     
-    antecedentes = await recuperar_memoria_cliente(telefono, texto)
+    consulta_memoria = texto or ("imagen adjunta" if message_type == "image" else "audio de voz")
+    antecedentes = await recuperar_memoria_cliente(telefono, consulta_memoria)
     
-    prompt_usuario = (
+    prompt_contexto = (
         f"[Antecedentes del cliente en sistema: {antecedentes}]\n"
-        f"[Cliente: {nombre_remitente}, Tel: {telefono}]: {texto}"
+        f"[Cliente: {nombre_remitente}, Tel: {telefono}]"
     )
+    
+    content_blocks = []
+    
+    if message_type == "image" and media_base64:
+        clean_mime = mime_type.split(";")[0] if mime_type else "image/jpeg"
+        prompt_texto = f"{prompt_contexto}\n[El cliente envió una imagen/foto con el comentario: '{texto}']\nAnaliza la imagen enviada para comprender su solicitud de diseño gráfico."
+        content_blocks.append({"type": "text", "text": prompt_texto})
+        content_blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{clean_mime};base64,{media_base64}"}
+        })
+    elif message_type == "audio" and media_base64:
+        clean_mime = mime_type.split(";")[0] if mime_type else "audio/ogg"
+        prompt_texto = f"{prompt_contexto}\n[El cliente envió una nota de voz/audio]. Escucha el audio atentamente y responde su solicitud comercial."
+        content_blocks.append({"type": "text", "text": prompt_texto})
+        content_blocks.append({
+            "type": "media",
+            "mime_type": clean_mime,
+            "data": media_base64
+        })
+    else:
+        prompt_texto = f"{prompt_contexto}: {texto}"
+        content_blocks.append({"type": "text", "text": prompt_texto})
     
     # Restringe a 5 llamadas simultáneas hacia la API de Google
     async with gemini_semaphore:
         output = await graph.ainvoke(
-            {"messages": [HumanMessage(content=prompt_usuario)]},
+            {"messages": [HumanMessage(content=content_blocks)]},
             config=config
         )
     
@@ -564,10 +605,11 @@ async def procesar_mensaje_ia(remote_jid: str, nombre_remitente: str, texto: str
     await enviar_mensaje_whatsapp(remote_jid, respuesta_final)
     
     # Tarea en background para guardar memoria del cliente sin bloquear
+    texto_resumen = texto or (f"[{message_type.upper()} enviado por cliente]" if message_type != "text" else "")
     asyncio.create_task(
         asyncio.to_thread(
             extraer_y_guardar_hechos_cliente,
-            telefono, nombre_remitente, texto, respuesta_final
+            telefono, nombre_remitente, texto_resumen, respuesta_final
         )
     )
 
@@ -611,13 +653,15 @@ async def obtener_resumen_ventas_hoy() -> str:
         return f"❌ Error generando resumen: {e}"
 
 @app.post("/webhook")
-async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
-    datos = await request.json()
-    remote_jid = datos.get("remoteJid", "")
-    nombre = datos.get("name", "Cliente")
-    texto = (datos.get("message") or "").strip()
+async def recibir_webhook(payload: WebhookPayload, background_tasks: BackgroundTasks):
+    remote_jid = payload.remoteJid
+    nombre = payload.name
+    texto = (payload.message or "").strip()
+    msg_type = payload.messageType
+    media_b64 = payload.mediaBase64
+    mime = payload.mimeType
 
-    if remote_jid and texto:
+    if remote_jid and (texto or media_b64):
         # Extraer identificador numérico
         identificador = remote_jid.split("@")[0]
 
@@ -637,7 +681,10 @@ async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
             procesar_mensaje_ia, 
             remote_jid, 
             nombre, 
-            texto
+            texto,
+            msg_type,
+            media_b64,
+            mime
         )
 
     return {"status": "received"}
