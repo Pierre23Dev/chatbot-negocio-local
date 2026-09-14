@@ -21,7 +21,7 @@ from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient, AsyncQdrantClient
+from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 from qdrant_client.http.models import Distance, VectorParams
 
@@ -97,35 +97,32 @@ embeddings = HuggingFaceEmbeddings(
 )
 
 
-client_qdrant_sync = QdrantClient(url=QDRANT_URL)
-client_qdrant_async = AsyncQdrantClient(url=QDRANT_URL)
+client_qdrant = QdrantClient(url=QDRANT_URL)
 
 
 # 1. Vectorstore de Conocimientos del Negocio
 vectorstore_knowledge = QdrantVectorStore(
-    client=client_qdrant_sync,
-    async_client=client_qdrant_async,
+    client=client_qdrant,
     collection_name=COLLECTION_KNOWLEDGE,
     embedding=embeddings
 )
 
 
 # 2. Vectorstore de Memoria a Largo Plazo de Clientes
-if not client_qdrant_sync.collection_exists(COLLECTION_CLIENTS):
-    client_qdrant_sync.create_collection(
+if not client_qdrant.collection_exists(COLLECTION_CLIENTS):
+    client_qdrant.create_collection(
         collection_name=COLLECTION_CLIENTS,
         vectors_config=VectorParams(size=384, distance=Distance.COSINE),
     )
     # Índice payload sobre el teléfono para búsquedas instantáneas y aisladas
-    client_qdrant_sync.create_payload_index(
+    client_qdrant.create_payload_index(
         collection_name=COLLECTION_CLIENTS,
         field_name="metadata.telefono",
         field_schema=qmodels.PayloadSchemaType.KEYWORD,
     )
 
 vectorstore_clientes = QdrantVectorStore(
-    client=client_qdrant_sync,
-    async_client=client_qdrant_async,
+    client=client_qdrant,
     collection_name=COLLECTION_CLIENTS,
     embedding=embeddings,
 )
