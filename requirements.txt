@@ -14,3 +14,4 @@ langchain-huggingface
 sentence-transformers
 langgraph-checkpoint-sqlite
 apscheduler
+httpx
