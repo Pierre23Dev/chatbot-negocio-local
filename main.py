@@ -1,4 +1,5 @@
 import os
+import httpx
 import torch
 import sqlite3
 import requests
@@ -11,10 +12,8 @@ from datetime import datetime
 from typing import Annotated, Literal
 from dotenv import load_dotenv
 
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from fastapi import FastAPI, Request, BackgroundTasks
 import uvicorn
-import torch
 
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_core.documents import Document
@@ -22,17 +21,20 @@ from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
+from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qmodels
 from qdrant_client.http.models import Distance, VectorParams
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from typing_extensions import TypedDict
 
 from contextlib import asynccontextmanager
-from apscheduler.schedulers.background import BackgroundScheduler
+
+import aiosqlite
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv()
 
@@ -43,41 +45,44 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "http://localhost:8080")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "clave_secreta_para_tu_api_local")
 ADMIN_PHONE = os.getenv("ADMIN_PHONE")
-# 1. Asegúrate de cargar tu clave real del entorno (sin el símbolo '$' de bash)
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+
 
 COLLECTION_KNOWLEDGE = "diseno_grafico_knowledge"
 COLLECTION_CLIENTS = "clientes_memoria"
 
+DB_VENTAS = "ventas.db"
+
 # --- Control de Concurrencia para Gemini ---
 gemini_semaphore = asyncio.Semaphore(5)
+scheduler = AsyncIOScheduler()
 
 # --- Inicialización de SQLite con Modo WAL ---
-def init_db():
-    conn = sqlite3.connect("ventas.db", timeout=15)
-    cursor = conn.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL;")
-    cursor.execute("PRAGMA busy_timeout=5000;")
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS ventas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fecha TEXT,
-            nombre_cliente TEXT,
-            telefono TEXT,
-            servicio TEXT,
-            monto TEXT,
-            estado TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+async def init_db():
+    async with get_ventas_db() as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA busy_timeout=5000;")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ventas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fecha TEXT,
+                nombre_cliente TEXT,
+                telefono TEXT,
+                servicio TEXT,
+                monto TEXT,
+                estado TEXT
+            )
+        """)
+        await db.commit()
 
-init_db()
+
+# Cliente HTTP asíncrono compartido
+http_client: httpx.AsyncClient = None
 
 # --- Conexión RAG Local con multilingual-e5-small (float16) ---
+device = "cuda" if torch.cuda.is_available() else "cpu"
 model_kwargs = {
     "torch_dtype": torch.float16,
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "device_map": device,
 }
 
 encode_kwargs = {
@@ -90,7 +95,7 @@ embeddings = HuggingFaceEmbeddings(
     encode_kwargs=encode_kwargs,
 )
 
-client_qdrant = QdrantClient(url=QDRANT_URL)
+client_qdrant = AsyncQdrantClient(url=QDRANT_URL)
 
 # 1. Vectorstore de Conocimientos del Negocio
 vectorstore_knowledge = QdrantVectorStore(
@@ -98,28 +103,28 @@ vectorstore_knowledge = QdrantVectorStore(
     collection_name=COLLECTION_KNOWLEDGE,
     embedding=embeddings
 )
-retriever_knowledge = vectorstore_knowledge.as_retriever(search_kwargs={"k": 2})
 
 # 2. Vectorstore de Memoria a Largo Plazo de Clientes
-if not client_qdrant.collection_exists(COLLECTION_CLIENTS):
-    client_qdrant.create_collection(
-        collection_name=COLLECTION_CLIENTS,
-        vectors_config=VectorParams(size=384, distance=Distance.COSINE),
-    )
-    # Índice payload sobre el teléfono para búsquedas instantáneas y aisladas
-    client_qdrant.create_payload_index(
-        collection_name=COLLECTION_CLIENTS,
-        field_name="metadata.telefono",
-        field_schema=qmodels.PayloadSchemaType.KEYWORD,
-    )
-
 vectorstore_clientes = QdrantVectorStore(
     client=client_qdrant,
-    collection_name=COLLECTION_NAME,
+    collection_name=COLLECTION_CLIENTS,
     embedding=embeddings,
 )
 
-retriever = vectorstore.as_retriever(
+async def init_qdrant():
+    if not await client_qdrant.collection_exists(COLLECTION_CLIENTS):
+        await client_qdrant.create_collection(
+            collection_name=COLLECTION_CLIENTS,
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+        )
+        # Índice payload sobre el teléfono para búsquedas instantáneas y aisladas
+        await client_qdrant.create_payload_index(
+            collection_name=COLLECTION_CLIENTS,
+            field_name="metadata.telefono",
+            field_schema=qmodels.PayloadSchemaType.KEYWORD,
+        )
+
+retriever = vectorstore_knowledge.as_retriever(
     search_type="similarity_score_threshold",
     search_kwargs={
         "k": 3,                    # Límite máximo de fragmentos
@@ -127,8 +132,27 @@ retriever = vectorstore.as_retriever(
     }
 )
 
+@asynccontextmanager
+async def get_ventas_db():
+    """Generador de conexiones asíncronas seguras hacia ventas.db."""
+    async with aiosqlite.connect(DB_VENTAS, timeout=15.0) as db:
+        db.row_factory = aiosqlite.Row
+        yield db
 
-def notificar_venta_discord(nombre: str, telefono: str, servicio: str, monto: float):
+
+RE_MONTO = re.compile(r"[-+]?\d*\.\d+|\d+")
+
+def limpiar_monto(valor) -> float:
+    if valor is None:
+        return 0.0
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    coincidencias = RE_MONTO.findall(str(valor).replace(",", "."))
+    return float(coincidencias[0]) if coincidencias else 0.0
+
+
+
+async def notificar_venta_discord(nombre: str, telefono: str, servicio: str, monto: float):
     """Envía un Embed enriquecido al canal de Discord vía Webhook."""
     if not DISCORD_WEBHOOK_URL:
         print("⚠️ Advertencia: DISCORD_WEBHOOK_URL no configurado.")
@@ -136,26 +160,39 @@ def notificar_venta_discord(nombre: str, telefono: str, servicio: str, monto: fl
 
     ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    embed = {
-        "title": "🎉 ¡Nueva Venta Registrada!",
-        "description": "Se ha cerrado un pedido desde el bot de WhatsApp.",
-        "color": 3066993,  # Código hexadecimal en decimal (Verde #2ECC71)
-        "fields": [
-            {"name": "👤 Cliente", "value": nombre, "inline": True},
-            {"name": "📱 Teléfono / JID", "value": telefono, "inline": True},
-            {"name": "💼 Servicio Contratado", "value": servicio, "inline": False},
-            {"name": "💵 Monto Acordado", "value": f"${monto:.2f} USD", "inline": True},
-            {"name": "⏳ Estado", "value": "Pendiente Confirmación Anticipo (50%)", "inline": True},
-        ],
-        "footer": {
-            "text": f"Registrado el {ahora} | WhatsApp AI Gateway"
-        }
+    payload = {
+        "username": "Bot de Ventas",
+        "embeds": [
+            {
+                "title": "🎉 ¡Nueva Venta Registrada!",
+                "description": "Se ha cerrado un pedido desde el bot de WhatsApp.",
+                "color": 3066993,  # Verde #2ECC71
+                "fields": [
+                    {"name": "👤 Cliente", "value": nombre, "inline": True},
+                    {"name": "📱 Teléfono / JID", "value": telefono, "inline": True},
+                    {"name": "💼 Servicio Contratado", "value": servicio, "inline": False},
+                    {"name": "💵 Monto Acordado", "value": f"${monto:.2f} USD", "inline": True},
+                    {"name": "⏳ Estado", "value": "Pendiente Confirmación Anticipo (50%)", "inline": True},
+                ],
+                "footer": {
+                    "text": f"Registrado el {ahora} | WhatsApp AI Gateway"
+                }
+            }
+        ]
     }
+
+    try:
+        res = await http_client.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5.0)
+        res.raise_for_status()
+        print(f"✅ Alerta de venta enviada a Discord para {nombre}.")
+    except Exception as e:
+        print(f"❌ Error al enviar notificación a Discord: {e}")
+
 
 # --- Funciones de Memoria RAG de Clientes ---
 
-def recuperar_memoria_cliente(telefono: str, consulta_actual: str) -> str:
-    """Busca antecedentes del cliente en Qdrant filtrando estrictamente por su número."""
+async def recuperar_memoria_cliente(telefono: str, consulta_actual: str) -> str:
+    """Busca antecedentes del cliente en Qdrant filtrando strictly por su número."""
     try:
         filtro_cliente = qmodels.Filter(
             must=[
@@ -166,7 +203,7 @@ def recuperar_memoria_cliente(telefono: str, consulta_actual: str) -> str:
             ]
         )
         # E5 requiere 'query: ' para buscar
-        resultados = vectorstore_clientes.similarity_search(
+        resultados = await vectorstore_clientes.asimilarity_search(
             query=f"query: {consulta_actual}",
             k=2,
             filter=filtro_cliente
@@ -184,7 +221,9 @@ def recuperar_memoria_cliente(telefono: str, consulta_actual: str) -> str:
 llm_resumen = ChatGoogleGenerativeAI(
     model="gemma-4-26b-a4b-it",
     google_api_key=GOOGLE_API_KEY,
-    temperature=0.0
+    temperature=0.0,
+    request_timeout=5,
+    max_retries=1
 )
 
 def extraer_y_guardar_hechos_cliente(telefono: str, nombre: str, texto_cliente: str, respuesta_bot: str):
@@ -217,11 +256,11 @@ Hecho clave extraído:"""
 # --- Herramientas del Agente ---
 
 @tool
-def consultar_servicios_y_politicas(consulta: str) -> str:
+async def consultar_servicios_y_politicas(consulta: str) -> str:
     """Consulta la base de conocimientos sobre precios, servicios, tiempos de entrega y políticas del negocio de diseño gráfico."""
     # E5 requiere obligatoriamente el prefijo 'query: ' para recuperar información
     consulta_formateada = f"query: {consulta.strip()}"
-    docs = retriever.invoke(consulta_formateada)
+    docs = await retriever.ainvoke(consulta_formateada)
     if not docs:
         return "No se encontró información específica en los documentos del negocio."
     # Unir fragmentos con separación clara
@@ -231,46 +270,31 @@ def consultar_servicios_y_politicas(consulta: str) -> str:
     return contenido[:2000]
 
 @tool
-def registrar_venta_cerrada(nombre_cliente: str, telefono: str, servicio: str, monto: str) -> str:
+async def registrar_venta_cerrada(nombre_cliente: str, telefono: str, servicio: str, monto: str) -> str:
     """Registra una venta cerrada en la base de datos local y envía una alerta a Discord. Usar solo cuando el cliente confirme el servicio."""
     fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     try:
-        conn = sqlite3.connect("ventas.db", timeout=15)
-        conn.execute("PRAGMA busy_timeout=5000;")
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO ventas (fecha, nombre_cliente, telefono, servicio, monto, estado) VALUES (?, ?, ?, ?, ?, ?)",
-            (fecha_actual, nombre_cliente, telefono, servicio, monto, "Pendiente Confirmación Anticipo")
-        )
-        conn.commit()
-        conn.close()
+        async with get_ventas_db() as db:
+            await db.execute(
+                "INSERT INTO ventas (fecha, nombre_cliente, telefono, servicio, monto, estado) VALUES (?, ?, ?, ?, ?, ?)",
+                (fecha_actual, nombre_cliente, telefono, servicio, monto, "Pendiente Confirmación Anticipo")
+            )
+            await db.commit()
     except Exception as e:
-        print(f"Error al escribir en SQLite: {e}")
+        print(f"Error al escribir en SQLite con aiosqlite: {e}")
 
-    # Notificación en Discord
-    if DISCORD_WEBHOOK_URL:
-        payload = {
-            "username": "Bot de Ventas",
-            "embeds": [{
-                "title": "🎉 ¡Nueva Venta Cerrada!",
-                "color": 3066993,
-                "fields": [
-                    {"name": "👤 Cliente", "value": nombre_cliente, "inline": True},
-                    {"name": "📱 Teléfono", "value": telefono, "inline": True},
-                    {"name": "🛠 Servicio", "value": servicio, "inline": False},
-                    {"name": "💵 Monto", "value": monto, "inline": True},
-                    {"name": "🗓 Fecha", "value": fecha_actual, "inline": True}
-                ],
-                "footer": {"text": "Registrado en ventas.db"}
-            }]
-        }
-        try:
-            requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
-        except Exception as e:
-            print(f"Error al notificar a Discord: {e}")
+    # Notificación a Discord
+    monto_numerico = limpiar_monto(monto)
+    await notificar_venta_discord(
+        nombre=nombre_cliente,
+        telefono=telefono,
+        servicio=servicio,
+        monto=monto_numerico
+    )
 
     return "Venta registrada con éxito. Se ha guardado en la base de datos y alertado al equipo."
+
 
 tools = [consultar_servicios_y_politicas, registrar_venta_cerrada]
 tools_by_name = {t.name: t for t in tools}
@@ -279,7 +303,7 @@ tools_by_name = {t.name: t for t in tools}
 llm_gemini = ChatGoogleGenerativeAI(
     model="gemini-3.1-flash-lite",
     google_api_key=GOOGLE_API_KEY,
-    temperature=0.2
+    temperature=0.2,
     request_timeout=8,
     max_retries=1
 )
@@ -317,26 +341,26 @@ REGLAS DE OPERACIÓN:
 
 
 # 4. Nodos de LangGraph
-def call_model(state: AgentState):
+async def call_model(state: AgentState):
     # Conservamos solo los últimos 8 mensajes del hilo activo
     mensajes_recientes = state["messages"][-8:]
 
     # Si tienes contexto recuperado de la memoria del cliente, se agrega aquí
     messages = [SYSTEM_PROMPT] + mensajes_recientes
-    response = router_llm.invoke(messages)
+    response = await router_llm.ainvoke(messages)
     return {"messages": [response]}
 
 
-def call_tools(state: AgentState):
+async def call_tools(state: AgentState):
     last_message = state["messages"][-1]
-    
     if not getattr(last_message, "tool_calls", None):
         return {"messages": []}
         
     results = []
     for tool_call in last_message.tool_calls:
         tool_fn = tools_by_name[tool_call["name"]]
-        output = tool_fn.invoke(tool_call["args"])
+        # Ejecución asíncrona de la tool
+        output = await tool_fn.ainvoke(tool_call["args"])
         results.append(ToolMessage(content=str(output), tool_call_id=tool_call["id"]))
         
     return {"messages": results}
@@ -357,24 +381,13 @@ workflow.add_edge(START, "agent")
 workflow.add_conditional_edges("agent", route_after_model, {"tools": "tools", "__end__": END})
 workflow.add_edge("tools", "agent")
 
-# Memoria SQLite con WAL y busy_timeout configurado
-memory_conn = sqlite3.connect("conversations.db", check_same_thread=False, timeout=15)
-memory_conn.execute("PRAGMA journal_mode=WAL;")
-memory_conn.execute("PRAGMA busy_timeout=5000;")
-checkpointer = SqliteSaver(memory_conn)
-graph = workflow.compile(checkpointer=checkpointer)
+# El checkpointer y graph se inicializan en el lifespan asíncrono
+graph = None
 
 # --- Reporte Diario Discord ---
 
-def limpiar_monto(valor) -> float:
-    if valor is None:
-        return 0.0
-    if isinstance(valor, (int, float)):
-        return float(valor)
-    coincidencias = re.findall(r"[-+]?\d*\.\d+|\d+", str(valor).replace(",", "."))
-    return float(coincidencias[0]) if coincidencias else 0.0
 
-def enviar_reporte_diario_discord():
+async def enviar_reporte_diario_discord():
     if not DISCORD_WEBHOOK_URL:
         print("⚠️ DISCORD_WEBHOOK_URL no configurado para el reporte diario.")
         return
@@ -383,13 +396,13 @@ def enviar_reporte_diario_discord():
     archivo_csv = f"reporte_ventas_{hoy_str}.csv"
 
     try:
-        conn = sqlite3.connect("ventas.db", timeout=15)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM ventas WHERE fecha LIKE ? ORDER BY id ASC", (f"{hoy_str}%",))
-        filas = cursor.fetchall()
-        columnas = [col[0] for col in cursor.description]
-        conn.close()
+        async with get_ventas_db() as db:
+            async with db.execute(
+                "SELECT * FROM ventas WHERE fecha LIKE ? ORDER BY id ASC", 
+                (f"{hoy_str}%",)
+            ) as cursor:
+                filas = await cursor.fetchall()
+                columnas = [desc[0] for desc in cursor.description]
 
         total_ventas = len(filas)
         if total_ventas == 0:
@@ -398,14 +411,13 @@ def enviar_reporte_diario_discord():
                 "embeds": [{
                     "title": f"📊 Cierre Diario — {hoy_str}",
                     "description": "Hoy no se registraron nuevas ventas confirmadas.",
-                    "color": 9807270,
-                    "footer": {"text": "WhatsApp AI Gateway | Reporte Automático"}
+                    "color": 9807270
                 }]
             }
-            requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-            print("📊 Reporte diario enviado a Discord (0 ventas).")
+            await http_client.post(DISCORD_WEBHOOK_URL, json=payload)
             return
 
+        # Escritura de CSV y envío multipart mediante httpx
         with open(archivo_csv, mode="w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow(columnas)
@@ -438,11 +450,11 @@ def enviar_reporte_diario_discord():
         }
 
         with open(archivo_csv, "rb") as f:
-            files = {"file": (archivo_csv, f, "text/csv")}
+            files = {"file": (archivo_csv, f.read(), "text/csv")}
             data = {"payload_json": json.dumps({"username": "Cierre Diario de Ventas", "embeds": [embed]})}
-            res = requests.post(DISCORD_WEBHOOK_URL, data=data, files=files, timeout=15)
+            res = await http_client.post(DISCORD_WEBHOOK_URL, data=data, files=files)
             if res.status_code in [200, 204]:
-                print(f"✅ Reporte diario y CSV enviados a Discord con éxito ({total_ventas} ventas).")
+                print(f"✅ Reporte diario enviado a Discord ({total_ventas} ventas).")
             else:
                 print(f"❌ Error al enviar reporte a Discord: {res.text}")
 
@@ -452,30 +464,54 @@ def enviar_reporte_diario_discord():
     except Exception as e:
         print(f"❌ Error generando reporte diario: {e}")
 
+
 # --- Servidor FastAPI ---
-scheduler = BackgroundScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler.add_job(enviar_reporte_diario_discord, trigger="cron", hour=20, minute=0)
-    scheduler.start()
-    yield
+    global http_client, graph
+    # Inicializa el pool de conexiones asíncronas optimizado
+    http_client = httpx.AsyncClient(
+        timeout=10.0,
+        limits=httpx.Limits(max_keepalive_connections=50, max_connections=200)
+    )
+
+    await init_db()
+    await init_qdrant()
+    
+    # Inicializar checkpointer asíncrono y compilar grafo
+    async with AsyncSqliteSaver.from_conn_string("conversations.db") as checkpointer:
+        graph = workflow.compile(checkpointer=checkpointer)
+        
+        # Tareas programadas
+        scheduler.add_job(enviar_reporte_diario_discord, "cron", hour=20, minute=0)
+        scheduler.start()
+        
+        yield
+    
+    # Cierre ordenado de conexiones
+    await http_client.aclose()
     scheduler.shutdown()
 
 app = FastAPI(title="WhatsApp AI Sales Agent", lifespan=lifespan)
 
-def enviar_mensaje_whatsapp(remote_jid: str, mensaje: str):
+async def enviar_mensaje_whatsapp(remote_jid: str, mensaje: str):
     url = "http://localhost:3001/send"
+    payload = {"remoteJid": remote_jid, "text": mensaje}
     try:
-        requests.post(url, json={"remoteJid": remote_jid, "text": mensaje}, timeout=10)
+        response = await http_client.post(url, json=payload)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        print(f"❌ Error HTTP al enviar WhatsApp ({e.response.status_code}): {e.response.text}")
     except Exception as e:
-        print(f"Error al enviar mensaje vía WhatsApp Gateway: {e}")
+        print(f"❌ Error de conexión con WhatsApp Gateway: {e}")
+
 
 async def procesar_mensaje_ia(remote_jid: str, nombre_remitente: str, texto: str):
     telefono = remote_jid.replace("@s.whatsapp.net", "").replace("@lid", "")
     config = {"configurable": {"thread_id": telefono}}
     
-    antecedentes = recuperar_memoria_cliente(telefono, texto)
+    antecedentes = await recuperar_memoria_cliente(telefono, texto)
     
     prompt_usuario = (
         f"[Antecedentes del cliente en sistema: {antecedentes}]\n"
@@ -484,8 +520,7 @@ async def procesar_mensaje_ia(remote_jid: str, nombre_remitente: str, texto: str
     
     # Restringe a 5 llamadas simultáneas hacia la API de Google
     async with gemini_semaphore:
-        output = await asyncio.to_thread(
-            graph.invoke,
+        output = await graph.ainvoke(
             {"messages": [HumanMessage(content=prompt_usuario)]},
             config=config
         )
@@ -496,31 +531,33 @@ async def procesar_mensaje_ia(remote_jid: str, nombre_remitente: str, texto: str
     else:
         respuesta_final = str(raw_content)
         
-    enviar_mensaje_whatsapp(remote_jid, respuesta_final)
+    await enviar_mensaje_whatsapp(remote_jid, respuesta_final)
     
-    # Hilo daemon desacoplado para extraer y guardar la memoria del cliente
-    threading.Thread(
-        target=extraer_y_guardar_hechos_cliente,
-        args=(telefono, nombre_remitente, texto, respuesta_final),
-        daemon=True
-    ).start()
+    # Tarea en background para guardar memoria del cliente sin bloquear
+    asyncio.create_task(
+        asyncio.to_thread(
+            extraer_y_guardar_hechos_cliente,
+            telefono, nombre_remitente, texto, respuesta_final
+        )
+    )
 
 
-def obtener_resumen_ventas_hoy() -> str:
-    """Consulta SQLite y devuelve un resumen formateado para WhatsApp."""
+async def obtener_resumen_ventas_hoy() -> str:
+    """Consulta SQLite asíncronamente y devuelve un resumen formateado para WhatsApp."""
     hoy_str = datetime.now().strftime("%Y-%m-%d")
     try:
-        conn = sqlite3.connect("ventas.db")
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM ventas WHERE fecha LIKE ? ORDER BY id ASC", (f"{hoy_str}%",))
-        filas = cursor.fetchall()
-        columnas = [col[0] for col in cursor.description]
-        conn.close()
+        async with get_ventas_db() as db:
+            async with db.execute(
+                "SELECT * FROM ventas WHERE fecha LIKE ? ORDER BY id ASC", 
+                (f"{hoy_str}%",)
+            ) as cursor:
+                filas = await cursor.fetchall()
+                columnas = [col[0] for col in cursor.description]
 
         if not filas:
             return f"📊 *Reporte del Día ({hoy_str})*\n\nNo se han registrado ventas el día de hoy."
 
+        # Detección dinámica de columnas según el esquema actual
         col_cliente = next((c for c in columnas if c in ["nombre", "cliente", "nombre_cliente"]), columnas[1])
         col_servicio = next((c for c in columnas if c in ["servicio", "producto", "item"]), columnas[2])
         col_precio = next((c for c in columnas if c in ["precio", "monto", "total"]), columnas[3])
@@ -543,7 +580,6 @@ def obtener_resumen_ventas_hoy() -> str:
     except Exception as e:
         return f"❌ Error generando resumen: {e}"
 
-
 @app.post("/webhook")
 async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
     datos = await request.json()
@@ -561,9 +597,9 @@ async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
 
         if es_admin and texto.lower() in ["/reporte", "/ventas", "!reporte"]:
             print(f"👑 Comando admin detectado desde {remote_jid}: {texto}")
-            reporte_texto = obtener_resumen_ventas_hoy()
+            reporte_texto = await obtener_resumen_ventas_hoy()
             # Se envía directo al socket sin pasar por Gemini
-            enviar_mensaje_whatsapp(remote_jid, reporte_texto)
+            await enviar_mensaje_whatsapp(remote_jid, reporte_texto)
             return {"status": "received"}
 
         # Flujo normal para clientes hacia Gemini / LangGraph
