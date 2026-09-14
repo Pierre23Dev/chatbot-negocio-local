@@ -245,32 +245,44 @@ llm_resumen = ChatGoogleGenerativeAI(
     max_retries=1
 )
 
+
 def extraer_y_guardar_hechos_cliente(telefono: str, nombre: str, texto_cliente: str, respuesta_bot: str):
-    """Ejecuta la extracción de datos clave en un hilo desacoplado del servidor."""
-    prompt = f"""Eres un analista de datos comerciales. Analiza esta interacción reciente de WhatsApp y extrae información CLAVE sobre el cliente en 1 frase concisa (rubro del negocio, preferencias visuales, requerimientos especiales, presupuesto mencionado).
-Si el mensaje solo contiene saludos, despedidas o preguntas genéricas sin datos sobre el perfil del cliente, responde únicamente la palabra: DESCARTAR.
+        """Ejecuta la extracción de datos clave en un hilo desacoplado del servidor."""
+        prompt = f"""Eres un analista de datos comerciales. Analiza esta interacción reciente de WhatsApp y extrae información CLAVE sobre el cliente en
+  1 frase concisa (rubro del negocio,nombre del cliente, preferencias visuales, requerimientos especiales, presupuesto mencionado).
+    Si el mensaje solo contiene saludos, despedidas o preguntas genéricas sin datos sobre el perfil del cliente, responde únicamente la palabra:
+  DESCARTAR.
 
-Cliente ({nombre}): {texto_cliente}
-Bot: {respuesta_bot}
+    Cliente ({nombre}): {texto_cliente}
+    Bot: {respuesta_bot}
 
-Hecho clave extraído:"""
+    Hecho clave extraído:"""
 
-    try:
-        resultado = llm_resumen.invoke([HumanMessage(content=prompt)]).content.strip()
-        
-        if "DESCARTAR" not in resultado and len(resultado) > 10:
-            doc = Document(
-                page_content=f"passage: {resultado}",
-                metadata={
-                    "telefono": telefono,
-                    "nombre": nombre,
-                    "fecha": datetime.now().strftime("%Y-%m-%d %H:%M")
-                }
-            )
-            vectorstore_clientes.add_documents([doc])
-            print(f"🧠 Memoria guardada en Qdrant para {telefono}: {resultado}")
-    except Exception as e:
-        print(f"Error al sintetizar o guardar memoria de cliente: {e}")
+        try:
+            res_message = llm_resumen.invoke([HumanMessage(content=prompt)])
+            raw_content = res_message.content
+
+            # Validación de tipo para str o list
+            if isinstance(raw_content, list):
+                resultado = "".join([b.get("text", "") if isinstance(b, dict) else str(b) for b in raw_content]).strip()
+            else:
+                resultado = str(raw_content).strip()
+
+            if "DESCARTAR" not in resultado and len(resultado) > 10:
+                doc = Document(
+                    page_content=f"passage: {resultado}",
+                    metadata={
+                        "telefono": telefono,
+                        "nombre": nombre,
+                        "fecha": datetime.now().strftime("%Y-%m-%d %H:%M")
+                    }
+                )
+                vectorstore_clientes.add_documents([doc])
+                print(f"🧠 Memoria guardada en Qdrant para {telefono}: {resultado}")
+        except Exception as e:
+            print(f"Error al sintetizar o guardar memoria de cliente: {e}")
+
+
 
 # --- Herramientas del Agente ---
 
