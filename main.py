@@ -8,12 +8,13 @@ import re
 import json
 import asyncio
 import threading
+import base64
 from datetime import datetime
 from typing import Annotated, Literal, Optional
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request, BackgroundTasks, Response
 import uvicorn
 
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
@@ -43,9 +44,13 @@ load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "http://localhost:8080")
-EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "clave_secreta_para_tu_api_local")
 ADMIN_PHONE = os.getenv("ADMIN_PHONE")
+
+# --- Configuración Meta Cloud API ---
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "mi_token_secreto_123")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+GRAPH_API_URL = "https://graph.facebook.com/v21.0"
 
 
 COLLECTION_KNOWLEDGE = "diseno_grafico_knowledge"
@@ -526,25 +531,89 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="WhatsApp AI Sales Agent", lifespan=lifespan)
 
-async def enviar_mensaje_whatsapp(remote_jid: str, mensaje: str):
-    url = "http://localhost:3001/send"
-    payload = {"remoteJid": remote_jid, "text": mensaje}
+# --- Límites y Funciones Auxiliares para Meta Cloud API ---
+LIMITES_META = {
+    "texto": 3000,                      # caracteres
+    "imagen": 5 * 1024 * 1024,          # 5 MB
+    "audio": 3 * 1024 * 1024            # 3 MB (~90 seg)
+}
+
+async def descargar_media_meta_con_limite(media_id: str):
+    """Consulta la URL del media_id en Meta Graph API y descarga el contenido si cumple los límites de tamaño."""
+    if not WHATSAPP_TOKEN or not media_id:
+        return None, None, "error_config"
+
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    
     try:
-        response = await http_client.post(url, json=payload)
-        response.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        print(f"❌ Error HTTP al enviar WhatsApp ({e.response.status_code}): {e.response.text}")
+        # 1. Obtener URL y metadata del archivo en Meta
+        res_info = await http_client.get(
+            f"{GRAPH_API_URL}/{media_id}", 
+            headers=headers, 
+            timeout=10.0
+        )
+        if res_info.status_code != 200:
+            print(f"❌ Error al consultar metadata de media_id {media_id} en Meta ({res_info.status_code}): {res_info.text}")
+            return None, None, "error_metadata"
+        
+        info = res_info.json()
+        file_size = info.get("file_size", 0)
+        mime = info.get("mime_type", "")
+        media_url = info.get("url")
+
+        # 2. Aplicar validación de límites de tamaño
+        if "image" in mime and file_size > LIMITES_META["imagen"]:
+            print(f"⚠️ Imagen descartada: {file_size} bytes excede límite de 5 MB.")
+            return None, mime, "imagen_muy_grande"
+        if "audio" in mime and file_size > LIMITES_META["audio"]:
+            print(f"⚠️ Audio descartado: {file_size} bytes excede límite de 3 MB.")
+            return None, mime, "audio_muy_largo"
+
+        # 3. Descargar el archivo binario desde la URL temporal de Meta
+        if not media_url:
+            return None, mime, "url_invalida"
+
+        res_bin = await http_client.get(media_url, headers=headers, timeout=20.0)
+        if res_bin.status_code != 200:
+            print(f"❌ Error al descargar binario de media desde Meta ({res_bin.status_code})")
+            return None, mime, "error_descarga"
+        
+        b64_data = base64.b64encode(res_bin.content).decode("utf-8")
+        return b64_data, mime, "ok"
+
     except Exception as e:
-        print(f"❌ Error de conexión con WhatsApp Gateway: {e}")
+        print(f"❌ Excepción al descargar media desde Meta ({media_id}): {e}")
+        return None, None, "error_excepcion"
 
 
-class WebhookPayload(BaseModel):
-    remoteJid: str
-    name: str = "Cliente"
-    messageType: str = "text"
-    message: Optional[str] = ""
-    mediaBase64: Optional[str] = None
-    mimeType: Optional[str] = None
+async def enviar_mensaje_whatsapp(remote_jid: str, mensaje: str):
+    """Envía un mensaje de texto al usuario utilizando la Cloud API oficial de Meta."""
+    phone = remote_jid.split("@")[0]
+    
+    if not PHONE_NUMBER_ID or not WHATSAPP_TOKEN:
+        print("⚠️ PHONE_NUMBER_ID o WHATSAPP_TOKEN no configurado en entorno.")
+        return
+
+    url = f"{GRAPH_API_URL}/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "text",
+        "text": {"body": mensaje}
+    }
+    
+    try:
+        response = await http_client.post(url, headers=headers, json=payload, timeout=10.0)
+        response.raise_for_status()
+        print(f"📤 Mensaje oficial enviado vía Meta Graph API a {phone}.")
+    except httpx.HTTPStatusError as e:
+        print(f"❌ Error HTTP al enviar WhatsApp vía Meta ({e.response.status_code}): {e.response.text}")
+    except Exception as e:
+        print(f"❌ Error de conexión con Meta Graph API: {e}")
 
 
 async def procesar_mensaje_ia(
@@ -552,12 +621,47 @@ async def procesar_mensaje_ia(
     nombre_remitente: str, 
     texto: str,
     message_type: str = "text",
-    media_base64: Optional[str] = None,
+    media_id_or_b64: Optional[str] = None,
     mime_type: Optional[str] = None
 ):
     telefono = remote_jid.replace("@s.whatsapp.net", "").replace("@lid", "")
     config = {"configurable": {"thread_id": telefono}}
     
+    # 1. Validación de longitud de texto
+    if message_type == "text" and len(texto) > LIMITES_META["texto"]:
+        await enviar_mensaje_whatsapp(
+            remote_jid,
+            "⚠️ Tu mensaje es demasiado largo. Por favor envíame tu consulta resumida en un par de líneas."
+        )
+        return
+
+    base64_final = None
+    mime_final = mime_type
+
+    # 2. Si viene un media_id de Meta (o Base64), procesarlo/descargarlo
+    if message_type in ["image", "audio", "video", "document"] and media_id_or_b64:
+        if len(media_id_or_b64) < 300 and "/" not in media_id_or_b64[:20]:
+            # Es un MEDIA_ID de Meta Cloud API
+            b64_data, mime_detected, estado = await descargar_media_meta_con_limite(media_id_or_b64)
+            if estado == "imagen_muy_grande":
+                await enviar_mensaje_whatsapp(
+                    remote_jid, 
+                    "⚠️ La imagen enviada pesa más de 5 MB. Por favor envíala comprimida."
+                )
+                return
+            elif estado == "audio_muy_largo":
+                await enviar_mensaje_whatsapp(
+                    remote_jid, 
+                    "⚠️ El audio enviado es muy largo (máx 3 MB / ~90 seg). Por favor envía una nota de voz más corta."
+                )
+                return
+            elif estado == "ok":
+                base64_final = b64_data
+                mime_final = mime_detected
+        else:
+            base64_final = media_id_or_b64
+
+    # 3. Recuperar memoria RAG del cliente
     consulta_memoria = texto or ("imagen adjunta" if message_type == "image" else "audio de voz")
     antecedentes = await recuperar_memoria_cliente(telefono, consulta_memoria)
     
@@ -568,22 +672,22 @@ async def procesar_mensaje_ia(
     
     content_blocks = []
     
-    if message_type == "image" and media_base64:
-        clean_mime = mime_type.split(";")[0] if mime_type else "image/jpeg"
+    if message_type == "image" and base64_final:
+        clean_mime = mime_final.split(";")[0] if mime_final else "image/jpeg"
         prompt_texto = f"{prompt_contexto}\n[El cliente envió una imagen/foto con el comentario: '{texto}']\nAnaliza la imagen enviada para comprender su solicitud de diseño gráfico."
         content_blocks.append({"type": "text", "text": prompt_texto})
         content_blocks.append({
             "type": "image_url",
-            "image_url": {"url": f"data:{clean_mime};base64,{media_base64}"}
+            "image_url": {"url": f"data:{clean_mime};base64,{base64_final}"}
         })
-    elif message_type == "audio" and media_base64:
-        clean_mime = mime_type.split(";")[0] if mime_type else "audio/ogg"
+    elif message_type == "audio" and base64_final:
+        clean_mime = mime_final.split(";")[0] if mime_final else "audio/ogg"
         prompt_texto = f"{prompt_contexto}\n[El cliente envió una nota de voz/audio]. Escucha el audio atentamente y responde su solicitud comercial."
         content_blocks.append({"type": "text", "text": prompt_texto})
         content_blocks.append({
             "type": "media",
             "mime_type": clean_mime,
-            "data": media_base64
+            "data": base64_final
         })
     else:
         prompt_texto = f"{prompt_contexto}: {texto}"
@@ -652,40 +756,75 @@ async def obtener_resumen_ventas_hoy() -> str:
     except Exception as e:
         return f"❌ Error generando resumen: {e}"
 
-@app.post("/webhook")
-async def recibir_webhook(payload: WebhookPayload, background_tasks: BackgroundTasks):
-    remote_jid = payload.remoteJid
-    nombre = payload.name
-    texto = (payload.message or "").strip()
-    msg_type = payload.messageType
-    media_b64 = payload.mediaBase64
-    mime = payload.mimeType
 
-    if remote_jid and (texto or media_b64):
-        # Extraer identificador numérico
-        identificador = remote_jid.split("@")[0]
+@app.get("/webhook")
+async def verificar_webhook(request: Request):
+    """Verifica la suscripción del webhook ante el reto inicial de Meta Cloud API."""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        print("✅ Webhook verificado exitosamente por Meta Cloud API.")
+        return Response(content=challenge, media_type="text/plain", status_code=200)
+    
+    print("❌ Fallo en la verificación del webhook de Meta (token inválido).")
+    return Response(content="Error de verificación", status_code=403)
+
+
+@app.post("/webhook")
+async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Recibe y procesa los eventos y mensajes en tiempo real enviados por Meta Cloud API."""
+    body = await request.json()
+
+    try:
+        entry = body.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {})
+        if "messages" not in entry:
+            # Es un estado de lectura / entrega de mensaje, responder 200 y salir
+            return {"status": "received"}
+
+        msg = entry["messages"][0]
+        contact = entry.get("contacts", [{}])[0]
+
+        sender_phone = msg.get("from", "")  # Número numérico del remitente (ej: 5939XXXXXXX)
+        remote_jid = f"{sender_phone}@s.whatsapp.net"
+        nombre = contact.get("profile", {}).get("name", "Cliente")
+        msg_type = msg.get("type", "text")
+
+        texto = ""
+        media_id = None
+        mime = None
+
+        if msg_type == "text":
+            texto = msg.get("text", {}).get("body", "")
+        elif msg_type in ["image", "audio", "video", "document"]:
+            media_id = msg.get(msg_type, {}).get("id")
+            mime = msg.get(msg_type, {}).get("mime_type")
+            texto = msg.get(msg_type, {}).get("caption", "")
 
         # --- COMANDOS EXCLUSIVOS DE ADMINISTRADOR ---
-        # Verifica si el remitente coincide con el admin y si solicita el reporte
-        es_admin = bool(ADMIN_PHONE and (ADMIN_PHONE in identificador or identificador in ADMIN_PHONE))
+        es_admin = bool(ADMIN_PHONE and ADMIN_PHONE in sender_phone)
 
         if es_admin and texto.lower() in ["/reporte", "/ventas", "!reporte"]:
-            print(f"👑 Comando admin detectado desde {remote_jid}: {texto}")
+            print(f"👑 Comando admin detectado desde {sender_phone}: {texto}")
             reporte_texto = await obtener_resumen_ventas_hoy()
-            # Se envía directo al socket sin pasar por Gemini
             await enviar_mensaje_whatsapp(remote_jid, reporte_texto)
             return {"status": "received"}
 
         # Flujo normal para clientes hacia Gemini / LangGraph
-        background_tasks.add_task(
-            procesar_mensaje_ia, 
-            remote_jid, 
-            nombre, 
-            texto,
-            msg_type,
-            media_b64,
-            mime
-        )
+        if remote_jid and (texto or media_id):
+            background_tasks.add_task(
+                procesar_mensaje_ia, 
+                remote_jid, 
+                nombre, 
+                texto,
+                msg_type,
+                media_id,
+                mime
+            )
+
+    except Exception as e:
+        print(f"❌ Error procesando webhook de Meta: {e}")
 
     return {"status": "received"}
 
