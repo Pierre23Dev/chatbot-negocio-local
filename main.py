@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request, BackgroundTasks, Response
+from fastapi.responses import PlainTextResponse
 import uvicorn
 
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
@@ -47,10 +48,10 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 ADMIN_PHONE = os.getenv("ADMIN_PHONE")
 
 # --- Configuración Meta Cloud API ---
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "mi_token_secreto_123")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-GRAPH_API_URL = "https://graph.facebook.com/v21.0"
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "mi_token_secreto_123_09")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "1281094735092275")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN") 
+GRAPH_API_URL = "https://graph.facebook.com/v25.0"
 
 
 COLLECTION_KNOWLEDGE = "diseno_grafico_knowledge"
@@ -585,10 +586,15 @@ async def descargar_media_meta_con_limite(media_id: str):
         print(f"❌ Excepción al descargar media desde Meta ({media_id}): {e}")
         return None, None, "error_excepcion"
 
+# --- HELPERS CLOUD API ---
+def limpiar_numero(numero: str) -> str:
+    return numero.replace("@s.whatsapp.net", "").replace("+", "").replace(" ", "")
 
-async def enviar_mensaje_whatsapp(remote_jid: str, mensaje: str):
+
+async def enviar_mensaje_whatsapp(to: str, mensaje: str):
     """Envía un mensaje de texto al usuario utilizando la Cloud API oficial de Meta."""
-    phone = remote_jid.split("@")[0]
+    
+    phone = limpiar_numero(to)
     
     if not PHONE_NUMBER_ID or not WHATSAPP_TOKEN:
         print("⚠️ PHONE_NUMBER_ID o WHATSAPP_TOKEN no configurado en entorno.")
@@ -764,36 +770,37 @@ async def verificar_webhook(request: Request):
     token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
 
+    print(f"Meta está verificando: mode={mode} token={token}") # para ver en consola
+
     if mode == "subscribe" and token == VERIFY_TOKEN:
         print("✅ Webhook verificado exitosamente por Meta Cloud API.")
-        return Response(content=challenge, media_type="text/plain", status_code=200)
+        return PlainTextResponse(content=challenge) # devolver como texto plano, no JSON ni int
+        #return Response(content=challenge, media_type="text/plain", status_code=200)
     
     print("❌ Fallo en la verificación del webhook de Meta (token inválido).")
     return Response(content="Error de verificación", status_code=403)
 
 
+# --- TU ENDPOINT ADAPTADO (POST) ---
 @app.post("/webhook")
 async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Recibe y procesa los eventos y mensajes en tiempo real enviados por Meta Cloud API."""
     body = await request.json()
-
+    print("🔥 WEBHOOK CRUDO:", body) # <--- ESTO ES CLAVE
     try:
         entry = body.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {})
         if "messages" not in entry:
-            # Es un estado de lectura / entrega de mensaje, responder 200 y salir
             return {"status": "received"}
 
         msg = entry["messages"][0]
         contact = entry.get("contacts", [{}])[0]
 
-        sender_phone = msg.get("from", "")  # Número numérico del remitente (ej: 5939XXXXXXX)
-        remote_jid = f"{sender_phone}@s.whatsapp.net"
+        sender_phone = limpiar_numero(msg.get("from", ""))
+        remote_jid = sender_phone # YA NO usamos @s.whatsapp.net para Cloud API
         nombre = contact.get("profile", {}).get("name", "Cliente")
         msg_type = msg.get("type", "text")
 
         texto = ""
-        media_id = None
-        mime = None
+        media_id = mime = None
 
         if msg_type == "text":
             texto = msg.get("text", {}).get("body", "")
@@ -802,29 +809,21 @@ async def recibir_webhook(request: Request, background_tasks: BackgroundTasks):
             mime = msg.get(msg_type, {}).get("mime_type")
             texto = msg.get(msg_type, {}).get("caption", "")
 
-        # --- COMANDOS EXCLUSIVOS DE ADMINISTRADOR ---
-        es_admin = bool(ADMIN_PHONE and ADMIN_PHONE in sender_phone)
+        es_admin = bool(ADMIN_PHONE and limpiar_numero(ADMIN_PHONE) in sender_phone)
 
         if es_admin and texto.lower() in ["/reporte", "/ventas", "!reporte"]:
-            print(f"👑 Comando admin detectado desde {sender_phone}: {texto}")
+            print(f"👑 Comando admin desde {sender_phone}: {texto}")
             reporte_texto = await obtener_resumen_ventas_hoy()
             await enviar_mensaje_whatsapp(remote_jid, reporte_texto)
             return {"status": "received"}
 
-        # Flujo normal para clientes hacia Gemini / LangGraph
         if remote_jid and (texto or media_id):
             background_tasks.add_task(
-                procesar_mensaje_ia, 
-                remote_jid, 
-                nombre, 
-                texto,
-                msg_type,
-                media_id,
-                mime
+                procesar_mensaje_ia, remote_jid, nombre, texto, msg_type, media_id, mime
             )
 
     except Exception as e:
-        print(f"❌ Error procesando webhook de Meta: {e}")
+        print(f"❌ Error procesando webhook: {e}")
 
     return {"status": "received"}
 
