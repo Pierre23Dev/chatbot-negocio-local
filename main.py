@@ -1,13 +1,9 @@
 import os
 import httpx
-import torch
-import sqlite3
-import requests
 import csv
 import re
 import json
 import asyncio
-import threading
 import base64
 from datetime import datetime
 from typing import Annotated, Literal, Optional
@@ -87,11 +83,8 @@ http_client: httpx.AsyncClient = None
 
 # --- Conexión RAG Local con multilingual-e5-small (float16) ---
 # esto funcionara en CPU y no se puede usar precision numerica de 16
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cpu"
 model_kwargs = {"device": device}
-
-if device == "cuda":
-    model_kwargs["model_kwargs"] = {"torch_dtype": torch.float16}
 
 encode_kwargs = {
     "normalize_embeddings": True
