@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Annotated, Literal, Optional
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from langchain_google_genai import GoogleGenAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 from fastapi import FastAPI, Request, BackgroundTasks, Response
 from fastapi.responses import PlainTextResponse
@@ -84,10 +84,12 @@ http_client: httpx.AsyncClient = None
 
 # --- Conexión RAG con Gemini Embeddings ---
 print("Inicializando Gemini Embeddings para consultas...")
-embeddings = GoogleGenAIEmbeddings(
+embeddings = GoogleGenerativeAIEmbeddings(
     model="models/gemini-embedding-001",
     # Forzamos a la API de Google a recortar el vector nativo a 384
-    output_dimensionality=384 
+    client_options={
+        "output_dimensionality": 384
+    }
 )
 
 client_qdrant = QdrantClient(url=QDRANT_URL)
