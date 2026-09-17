@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 # 1. Cambiamos la importación al ecosistema de Google
-from langchain_google_genai import GoogleGenAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
@@ -45,8 +45,9 @@ def indexar_documentos():
     # 2. Configuración del modelo de Embedding de Gemini
     print("Inicializando Gemini Embeddings (models/gemini-embedding-001)...")
     # Al ser una llamada de API externa, no necesitas configurar torch, CUDA o CPU locales.
-    embeddings = GoogleGenAIEmbeddings(
-        model="models/gemini-embedding-001"
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/gemini-embedding-001",  # El modelo oficial activo de Google
+        output_dimensionality=384            # Recorta nativamente el vector a 384 dimensiones
     )
 
     client = QdrantClient(url=QDRANT_URL)

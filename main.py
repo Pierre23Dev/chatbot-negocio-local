@@ -9,13 +9,13 @@ from datetime import datetime
 from typing import Annotated, Literal, Optional
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from langchain_google_genai import GoogleGenAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 from fastapi import FastAPI, Request, BackgroundTasks, Response
 from fastapi.responses import PlainTextResponse
 import uvicorn
 
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
 from langchain_core.documents import Document
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -40,7 +40,7 @@ load_dotenv()
 # --- Configuración de Entorno ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_URL = os.getenv("QDRANT_URL","http://localhost:6333/")
 ADMIN_PHONE = os.getenv("ADMIN_PHONE")
 
 # --- Configuración Meta Cloud API ---
@@ -84,10 +84,9 @@ http_client: httpx.AsyncClient = None
 
 # --- Conexión RAG con Gemini Embeddings ---
 print("Inicializando Gemini Embeddings para consultas...")
-embeddings = GoogleGenAIEmbeddings(
-    model="models/gemini-embedding-001",
-    # Forzamos a la API de Google a recortar el vector nativo a 384
-    output_dimensionality=384 
+embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/gemini-embedding-001",  # El modelo oficial activo de Google
+        output_dimensionality=384            # Recorta nativamente el vector a 384 dimensiones
 )
 
 client_qdrant = QdrantClient(url=QDRANT_URL)
