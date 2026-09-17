@@ -10,3 +10,4 @@ apscheduler
 httpx
 aiosqlite
 langchain-text-splitters
+langgraph-checkpoint-sqlite

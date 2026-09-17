@@ -46,11 +46,8 @@ def indexar_documentos():
     print("Inicializando Gemini Embeddings (models/gemini-embedding-001)...")
     # Al ser una llamada de API externa, no necesitas configurar torch, CUDA o CPU locales.
     embeddings = GoogleGenerativeAIEmbeddings(
-    model="models/gemini-embedding-001",
-    # Forzamos a la API de Google a recortar el vector nativo a 384
-    client_options={
-        "output_dimensionality": 384
-        }
+        model="models/gemini-embedding-001",  # El modelo oficial activo de Google
+        output_dimensionality=384            # Recorta nativamente el vector a 384 dimensiones
     )
 
     client = QdrantClient(url=QDRANT_URL)
