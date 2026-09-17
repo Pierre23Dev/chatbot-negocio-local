@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Annotated, Literal, Optional
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from langchain_google_genai import GoogleGenAIEmbeddings
 
 from fastapi import FastAPI, Request, BackgroundTasks, Response
 from fastapi.responses import PlainTextResponse
@@ -18,7 +19,6 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_core.documents import Document
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
@@ -40,12 +40,12 @@ load_dotenv()
 # --- Configuración de Entorno ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_URL = os.getenv("QDRANT_URL")
 ADMIN_PHONE = os.getenv("ADMIN_PHONE")
 
 # --- Configuración Meta Cloud API ---
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "mi_token_secreto_123_09")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "1281094735092275")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN") 
 GRAPH_API_URL = "https://graph.facebook.com/v25.0"
 
@@ -81,24 +81,16 @@ async def init_db():
 # Cliente HTTP asíncrono compartido
 http_client: httpx.AsyncClient = None
 
-# --- Conexión RAG Local con multilingual-e5-small (float16) ---
-# esto funcionara en CPU y no se puede usar precision numerica de 16
-device = "cpu"
-model_kwargs = {"device": device}
 
-encode_kwargs = {
-    "normalize_embeddings": True
-}
-
-embeddings = HuggingFaceEmbeddings(
-    model_name="intfloat/multilingual-e5-small",
-    model_kwargs=model_kwargs,
-    encode_kwargs=encode_kwargs,
+# --- Conexión RAG con Gemini Embeddings ---
+print("Inicializando Gemini Embeddings para consultas...")
+embeddings = GoogleGenAIEmbeddings(
+    model="models/gemini-embedding-001",
+    # Forzamos a la API de Google a recortar el vector nativo a 384
+    output_dimensionality=384 
 )
 
-
 client_qdrant = QdrantClient(url=QDRANT_URL)
-
 
 # 1. Vectorstore de Conocimientos del Negocio
 vectorstore_knowledge = QdrantVectorStore(
@@ -110,8 +102,10 @@ vectorstore_knowledge = QdrantVectorStore(
 
 # 2. Vectorstore de Memoria a Largo Plazo de Clientes
 if not client_qdrant.collection_exists(COLLECTION_CLIENTS):
+    print(f"Creando colección de clientes limpia: {COLLECTION_CLIENTS}")
     client_qdrant.create_collection(
         collection_name=COLLECTION_CLIENTS,
+        # IMPORTANTE: Cambiado a 768 para que coincida con el tamaño de vector de Gemini
         vectors_config=VectorParams(size=384, distance=Distance.COSINE),
     )
     # Índice payload sobre el teléfono para búsquedas instantáneas y aisladas
@@ -156,19 +150,36 @@ def limpiar_monto(valor) -> float:
 
 
 def sanitizar_mensajes_para_gemini(messages: list) -> list:
-        """Sanea el historial recortado para que no contenga ToolMessages huérfanos
-        ni rompa el orden de turnos exigido por la API de Gemini."""
-        if not messages:
-            return []
+    """
+    Sanea el historial recortando un número máximo de mensajes, asegurando
+    que no queden ToolMessages huérfanos y respetando las reglas de la API de Gemini.
+    """
+    if not messages:
+        return []
 
-        recientes = list(messages[-8:])
+    # 1. Si el último mensaje es un AIMessage que solicita herramientas,
+    # significa que el flujo quedó a la mitad. Retornamos todo el bloque actual.
+    if isinstance(messages[-1], AIMessage) and getattr(messages[-1], "tool_calls", None):
+        return messages[-2:] if len(messages) >= 2 else messages
 
-        # Eliminar ToolMessages u AIMessages huérfanos al inicio del recorte
-        while recientes and not isinstance(recientes[0], HumanMessage):
-            recientes.pop(0)
+    recientes = []
+    limite_mensajes = 8
+    
+    # 2. Recorremos al revés para no romper secuencias ToolMessage -> AIMessage
+    for msg in reversed(messages):
+        if len(recientes) >= limite_mensajes and isinstance(msg, HumanMessage):
+            # Solo dejamos de añadir si ya cumplimos la cuota y garantizamos 
+            # que el bloque comience con un mensaje del usuario.
+            recientes.insert(0, msg)
+            break
+        recientes.insert(0, msg)
 
-        return recientes if recientes else messages[-1:]
+    # 3. Limpieza de seguridad al inicio (Garantizar que empiece con HumanMessage)
+    while recientes and not isinstance(recientes[0], HumanMessage):
+        recientes.pop(0)
 
+    # 4. Si la limpieza vació la lista, devolvemos al menos el último mensaje válido
+    return recientes if recientes else [messages[-1]]
 
 
 async def notificar_venta_discord(nombre: str, telefono: str, servicio: str, monto: float):
@@ -289,15 +300,18 @@ def extraer_y_guardar_hechos_cliente(telefono: str, nombre: str, texto_cliente: 
 @tool
 async def consultar_servicios_y_politicas(consulta: str) -> str:
     """Consulta la base de conocimientos sobre precios, servicios, tiempos de entrega y políticas del negocio de diseño gráfico."""
-    # E5 requiere obligatoriamente el prefijo 'query: ' para recuperar información
-    consulta_formateada = f"query: {consulta.strip()}"
-    docs = await retriever.ainvoke(consulta_formateada)
+    
+    # 1. Gemini no requiere prefijos como 'query: '. Pasamos el texto limpio directamente.
+    docs = await retriever.ainvoke(consulta.strip())
+    
     if not docs:
         return "No se encontró información específica en los documentos del negocio."
-    # Unir fragmentos con separación clara
-    contenido = "\n\n---\n\n".join([d.page_content.replace("passage: ", "") for d in docs])
+        
+    # 2. Unimos los fragmentos de forma limpia. 
+    # Ya no hace falta remover "passage: " porque Gemini indexó el texto puro.
+    contenido = "\n\n---\n\n".join([d.page_content for d in docs])
     
-    # Límite estricto de seguridad (ej. 2000 caracteres)
+    # 3. Límite estricto de seguridad para el contexto
     return contenido[:2000]
 
 @tool
@@ -371,13 +385,19 @@ REGLAS DE OPERACIÓN:
 """)
 
 
-# 4. Nodos de LangGraph
+# 4. Nodos de LangGraph optimizados para Gemini
 async def call_model(state: AgentState):
-    # Conservamos solo los últimos 8 mensajes del hilo activo
+    # Asegúrate de que esta función devuelva una lista de mensajes (HumanMessage, AIMessage, ToolMessage)
     mensajes_recientes = sanitizar_mensajes_para_gemini(state["messages"])
 
-    # Si tienes contexto recuperado de la memoria del cliente, se agrega aquí
-    messages = [SYSTEM_PROMPT] + mensajes_recientes
+    # OPCIÓN RECOMENDADA PARA GEMINI:
+    # Si SYSTEM_PROMPT es un string, lo ideal es pasarlo como SystemMessage al inicio.
+    # Evita concatenarlo si 'mensajes_recientes' ya incluye un SystemMessage previo.
+    system_msg = SystemMessage(content=SYSTEM_PROMPT) if isinstance(SYSTEM_PROMPT, str) else SYSTEM_PROMPT
+    
+    messages = [system_msg] + mensajes_recientes
+    
+    # Invocación con tolerancia a fallos
     response = await router_llm.ainvoke(messages)
     return {"messages": [response]}
 
@@ -390,7 +410,8 @@ async def call_tools(state: AgentState):
     results = []
     for tool_call in last_message.tool_calls:
         tool_fn = tools_by_name[tool_call["name"]]
-        # Ejecución asíncrona de la tool
+        
+        # Ejecución asíncrona de la tool (aquí llamará a tu buscador Qdrant optimizado sin prefijos)
         output = await tool_fn.ainvoke(tool_call["args"])
         results.append(ToolMessage(content=str(output), tool_call_id=tool_call["id"]))
         
@@ -398,10 +419,10 @@ async def call_tools(state: AgentState):
 
 def route_after_model(state: AgentState) -> Literal["tools", "__end__"]:
     last_message = state["messages"][-1]
+    # Validación extra de seguridad sobre el atributo de llamada a herramientas
     if getattr(last_message, "tool_calls", None) and len(last_message.tool_calls) > 0:
         return "tools"
     return "__end__"
-
 
 # 5. Compilación del Workflow
 workflow = StateGraph(AgentState)
