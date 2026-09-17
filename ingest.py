@@ -1,15 +1,20 @@
 import os
 import sys
-import torch
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+# 1. Cambiamos la importación al ecosistema de Google
+from langchain_google_genai import GoogleGenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
 load_dotenv()
+
+# Validar que la API key de Google esté presente
+if not os.getenv("GOOGLE_API_KEY"):
+    print("[ERROR] No se encontró la variable GOOGLE_API_KEY en las variables de entorno.")
+    sys.exit(1)
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 COLLECTION_NAME = "diseno_grafico_knowledge"
@@ -37,43 +42,17 @@ def indexar_documentos():
     chunks = text_splitter.split_documents(documentos)
     print(f"Total de fragmentos generados: {len(chunks)}")
 
-    # 2. Inyección del prefijo 'passage: ' tras el split
-    # Es crucial aplicarlo después de dividir para evitar que el splitter corte el prefijo
-    for chunk in chunks:
-        chunk.page_content = f"passage: {chunk.page_content.strip()}"
-
-    # 3. Configuración del modelo multilingual-e5-small en float16
-    print("Cargando modelo local multilingual-e5-small (float16)...")
-    """Este script se ejecutara en CPU y En procesadores CPU, PyTorch no soporta operaciones 
-    matemáticas en float16 (Half Precision) y lanzará un error tipo 
-    RuntimeError: "addmm_impl_cpu_" not implemented for 'Half'. En CPU, el modelo debe correr en float32 (estándar),
-     lo cual no es problema porque multilingual-e5-small pesa apenas ~470 MB y consume muy poca memoria.
-    model_kwargs = {
-        "torch_dtype": torch.float16,
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
-    }
-    """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    model_kwargs = {"device": device}
-    # torch_dtype debe ir dentro de 'model_kwargs' anidado y solo si hay GPU
-    if device == "cuda":
-        model_kwargs["model_kwargs"] = {"torch_dtype": torch.float16}
-
-    encode_kwargs = {
-        "normalize_embeddings": True  # Normalización coseno requerida para modelos E5
-    }
-
-    embeddings = HuggingFaceEmbeddings(
-        model_name="intfloat/multilingual-e5-small",
-        model_kwargs=model_kwargs,
-        encode_kwargs=encode_kwargs,
+    # 2. Configuración del modelo de Embedding de Gemini
+    print("Inicializando Gemini Embeddings (models/gemini-embedding-001)...")
+    # Al ser una llamada de API externa, no necesitas configurar torch, CUDA o CPU locales.
+    embeddings = GoogleGenAIEmbeddings(
+        model="models/gemini-embedding-001"
     )
-
 
     client = QdrantClient(url=QDRANT_URL)
 
-    # 4. Recrear colección limpia (multilingual-e5-small usa 384 dimensiones)
+    # 3. Recrear colección limpia 
+    # IMPORTANTE: text-embedding-004 utiliza 768 dimensiones (E5 usaba 384)
     if client.collection_exists(collection_name=COLLECTION_NAME):
         print(f"Eliminando colección anterior: {COLLECTION_NAME}")
         client.delete_collection(collection_name=COLLECTION_NAME)
@@ -83,26 +62,17 @@ def indexar_documentos():
         vectors_config=VectorParams(size=384, distance=Distance.COSINE),
     )
 
-    """
-    # 5. Indexación en Qdrant - ESto no funciono
-    QdrantVectorStore.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        client=client,
-        collection_name=COLLECTION_NAME,
-    )
-    print("✅ ¡Base vectorial indexada correctamente con prefijos 'passage:' y float16!")
-    """
-
-    # 5. Indexación en Qdrant (Instanciación directa + add_documents)
+    # 4. Indexación en Qdrant (Instanciación directa + add_documents)
     vector_store = QdrantVectorStore(
         client=client,
         collection_name=COLLECTION_NAME,
         embedding=embeddings,
     )
+    
+    print("Generando embeddings a través de la API e indexando en Qdrant...")
     vector_store.add_documents(chunks)
 
-    print("✅ ¡Base vectorial indexada correctamente con prefijos 'passage:'!")
+    print("✅ ¡Base vectorial indexada correctamente con Gemini Embeddings!")
 
 if __name__ == "__main__":
     indexar_documentos()
