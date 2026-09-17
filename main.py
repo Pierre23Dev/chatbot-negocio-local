@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request, BackgroundTasks, Response
 from fastapi.responses import PlainTextResponse
 import uvicorn
 
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
 from langchain_core.documents import Document
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
