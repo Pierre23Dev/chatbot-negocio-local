@@ -84,7 +84,10 @@ async def lifespan(app: FastAPI):
             min_size=1,
             max_size=10,
             open=False,
-            kwargs={"autocommit": True}
+            kwargs={
+                "autocommit": True,
+                "prepare_threshold": None  # FIX CRÍTICO SUPABASE PGBOUNCER: Desactiva prepared statements para evitar DuplicatePreparedStatement
+            }
         )
         await db_pool.open()
         await init_db()
@@ -251,7 +254,9 @@ async def notificar_venta_discord(nombre: str, telefono: str, servicio: str, mon
 async def recuperar_memoria_cliente(tenant_phone: str, telefono: str, consulta_actual: str) -> str:
     """Busca antecedentes del cliente en Supabase PGVector filtrando estrictamente por tenant y teléfono."""
     try:
-        resultados = await vectorstore_clientes.asimilarity_search(
+        # Usar asyncio.to_thread con similarity_search para evitar dependencia de _async_engine en PGVector
+        resultados = await asyncio.to_thread(
+            vectorstore_clientes.similarity_search,
             query=f"query: {consulta_actual}",
             k=2,
             filter={"tenant_phone": tenant_phone, "telefono": telefono}
@@ -317,7 +322,9 @@ Hecho clave extraído:"""
 async def consultar_servicios_y_politicas(consulta: str, tenant_phone: str = "default_tenant") -> str:
     """Consulta la base de conocimientos RAG sobre precios, servicios y políticas del negocio específico."""
     try:
-        docs = await vectorstore_knowledge.asimilarity_search(
+        # Usar asyncio.to_thread para invocación segura de PGVector similarity_search
+        docs = await asyncio.to_thread(
+            vectorstore_knowledge.similarity_search,
             query=consulta.strip(),
             k=3,
             filter={"tenant_phone": tenant_phone}
