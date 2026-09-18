@@ -53,7 +53,6 @@ def indexar_documentos():
     client = QdrantClient(url=QDRANT_URL)
 
     # 3. Recrear colección limpia 
-    # IMPORTANTE: text-embedding-004 utiliza 768 dimensiones (E5 usaba 384)
     if client.collection_exists(collection_name=COLLECTION_NAME):
         print(f"Eliminando colección anterior: {COLLECTION_NAME}")
         client.delete_collection(collection_name=COLLECTION_NAME)
