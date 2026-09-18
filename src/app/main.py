@@ -83,6 +83,7 @@ async def lifespan(app: FastAPI):
             conninfo=DATABASE_URL_RAW,
             min_size=1,
             max_size=10,
+            open=False,
             kwargs={"autocommit": True}
         )
         await db_pool.open()
