@@ -50,6 +50,7 @@ venv/
 ENV/
 env/
 .venv/
+*.venv*
 
 # IDEs y Editores
 .vscode/
