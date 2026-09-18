@@ -1,38 +1,56 @@
 import os
 import sys
+import argparse
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-# 1. Cambiamos la importación al ecosistema de Google
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
+from langchain_postgres import PGVector
 
 load_dotenv()
 
-# Validar que la API key de Google esté presente
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+# Validar API key de Google
 if not os.getenv("GOOGLE_API_KEY"):
     print("[ERROR] No se encontró la variable GOOGLE_API_KEY en las variables de entorno.")
     sys.exit(1)
 
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    print("[ERROR] No se encontró la variable DATABASE_URL en las variables de entorno.")
+    print("Asegúrate de definir DATABASE_URL=postgresql+psycopg://postgres:[PASSWORD]@[HOST]:5432/postgres")
+    sys.exit(1)
+
+# Normalizar URL para dialecto psycopg3 en SQLAlchemy / PGVector
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
 COLLECTION_NAME = "diseno_grafico_knowledge"
 
-def cargar_documentos():
-    archivos = ["data/servicios.txt", "data/politicas.txt"]
+def cargar_documentos(tenant_phone: str, archivos: list) -> list:
     docs = []
     for ruta in archivos:
         if not os.path.exists(ruta):
-            print(f"[ERROR] No se encuentra el archivo: {ruta}")
-            sys.exit(1)
+            print(f"[ADVERTENCIA] No se encuentra el archivo: {ruta}")
+            continue
         with open(ruta, "r", encoding="utf-8") as f:
             contenido = f.read()
-            docs.append(Document(page_content=contenido, metadata={"source": ruta}))
+            docs.append(Document(
+                page_content=contenido,
+                metadata={
+                    "tenant_phone": tenant_phone,
+                    "source": ruta
+                }
+            ))
     return docs
 
-def indexar_documentos():
-    documentos = cargar_documentos()
+def indexar_documentos_tenant(tenant_phone: str, archivos: list, limpiar_anterior: bool = False):
+    documentos = cargar_documentos(tenant_phone, archivos)
+    if not documentos:
+        print("[ERROR] No se pudo cargar ningún documento para ingestar.")
+        sys.exit(1)
 
     # 1. Fragmentación del texto base
     text_splitter = RecursiveCharacterTextSplitter(
@@ -40,39 +58,43 @@ def indexar_documentos():
         chunk_overlap=60
     )
     chunks = text_splitter.split_documents(documentos)
-    print(f"Total de fragmentos generados: {len(chunks)}")
+    print(f"Total de fragmentos generados para tenant '{tenant_phone}': {len(chunks)}")
 
     # 2. Configuración del modelo de Embedding de Gemini
     print("Inicializando Gemini Embeddings (models/gemini-embedding-001)...")
-    # Al ser una llamada de API externa, no necesitas configurar torch, CUDA o CPU locales.
     embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/gemini-embedding-001",  # El modelo oficial activo de Google
-        output_dimensionality=384            # Recorta nativamente el vector a 384 dimensiones
+        model="models/gemini-embedding-001",
+        output_dimensionality=384
     )
 
-    client = QdrantClient(url=QDRANT_URL)
-
-    # 3. Recrear colección limpia 
-    if client.collection_exists(collection_name=COLLECTION_NAME):
-        print(f"Eliminando colección anterior: {COLLECTION_NAME}")
-        client.delete_collection(collection_name=COLLECTION_NAME)
-
-    client.create_collection(
+    # 3. Instanciación e indexación en Supabase PGVector
+    print(f"Conectando e indexando en Supabase PGVector (colección '{COLLECTION_NAME}')...")
+    vector_store = PGVector(
+        embeddings=embeddings,
         collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+        connection=DATABASE_URL,
+        use_jsonb=True
     )
 
-    # 4. Indexación en Qdrant (Instanciación directa + add_documents)
-    vector_store = QdrantVectorStore(
-        client=client,
-        collection_name=COLLECTION_NAME,
-        embedding=embeddings,
-    )
-    
-    print("Generando embeddings a través de la API e indexando en Qdrant...")
-    vector_store.add_documents(chunks)
+    if limpiar_anterior:
+        print(f"🗑️ Limpiando conocimientos RAG anteriores del tenant '{tenant_phone}'...")
+        try:
+            vector_store.delete(filter={"tenant_phone": tenant_phone})
+            print("✅ Registros anteriores eliminados exitosamente de Supabase.")
+        except Exception as e:
+            print(f"⚠️ Nota al limpiar registros previos: {e}")
 
-    print("✅ ¡Base vectorial indexada correctamente con Gemini Embeddings!")
+    # Generar IDs únicos y deterministas por fragmento para evitar duplicación mediante Upsert automático
+    ids = [f"{tenant_phone}_{chunk.metadata.get('source', 'doc')}_{idx}" for idx, chunk in enumerate(chunks)]
+
+    vector_store.add_documents(chunks, ids=ids)
+    print(f"✅ ¡Base vectorial RAG indexada correctamente en Supabase para tenant {tenant_phone}!")
 
 if __name__ == "__main__":
-    indexar_documentos()
+    parser = argparse.ArgumentParser(description="Ingesta de conocimientos RAG multi-tenant para Supabase PGVector")
+    parser.add_argument("--tenant", required=True, help="Número telefónico del tenant/negocio (ej: 5215512345678)")
+    parser.add_argument("--archivos", nargs="+", default=["data/servicios.txt", "data/politicas.txt"], help="Ruta de archivos a ingestar")
+    parser.add_argument("--limpiar", action="store_true", help="Elimina los documentos anteriores del tenant antes de ingestar los nuevos")
+
+    args = parser.parse_args()
+    indexar_documentos_tenant(args.tenant, args.archivos, args.limpiar)

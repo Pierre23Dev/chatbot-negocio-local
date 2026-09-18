@@ -3,11 +3,12 @@ uvicorn
 langchain-core
 langgraph
 langchain-google-genai
-langchain-qdrant
-qdrant-client
+langchain-postgres
+langgraph-checkpoint-postgres
+psycopg[binary]
+psycopg-pool
+supabase
+asyncpg
 python-dotenv
-apscheduler
 httpx
-aiosqlite
 langchain-text-splitters
-langgraph-checkpoint-sqlite
