@@ -50,6 +50,7 @@ venv/
 ENV/
 env/
 .venv/
+*.venv*
 
 # IDEs y Editores
 .vscode/
@@ -85,3 +86,6 @@ qdrant_storage/
 *.db
 *.db-shm
 *.db-wal
+
+#other
+main_other.py
