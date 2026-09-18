@@ -1,6 +1,8 @@
 import os
 # --- FIX CRÍTICO PARA VERCEL ---
+# Forzar el transporte de Gemini a REST para evitar fallos de gRPC HTTP/2 en Vercel Lambda
 os.environ["GEMINI_TRANSPORT"] = "rest"
+
 import httpx
 import csv
 import re
@@ -14,6 +16,7 @@ from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request, BackgroundTasks, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
@@ -57,12 +60,68 @@ COLLECTION_CLIENTS = "clientes_memoria"
 # Control de Concurrencia para Gemini en Serverless
 gemini_semaphore = asyncio.Semaphore(5)
 
-# Cliente HTTP asíncrono compartido
+# Variables globales para clientes asíncronos y grafo
 http_client: httpx.AsyncClient = None
 db_pool: AsyncConnectionPool = None
 graph = None
 
-# --- Inicialización de Tablas en Supabase ---
+# =================================================================================
+# 1. DECLARACIÓN DE APP Y HEALTH CHECK (COMPATIBILIDAD VERCEL SERVERLESS)
+# =================================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client, db_pool, graph
+    http_client = httpx.AsyncClient(
+        timeout=10.0,
+        limits=httpx.Limits(max_keepalive_connections=50, max_connections=200)
+    )
+
+    # Pool de conexiones asíncronas a Supabase PostgreSQL
+    try:
+        db_pool = AsyncConnectionPool(
+            conninfo=DATABASE_URL_RAW,
+            min_size=1,
+            max_size=10,
+            kwargs={"autocommit": True}
+        )
+        await db_pool.open()
+        await init_db()
+
+        # Compilar Grafo con Checkpointer de PostgreSQL
+        checkpointer = AsyncPostgresSaver(db_pool)
+        await checkpointer.setup()
+        graph = workflow.compile(checkpointer=checkpointer)
+    except Exception as e:
+        print(f"⚠️ Error inicializando checkpointer Postgres en Supabase, usando checkpointer sin persistencia: {e}")
+        graph = workflow.compile()
+
+    yield
+
+    if db_pool:
+        await db_pool.close()
+    if http_client:
+        await http_client.aclose()
+
+app = FastAPI(title="WhatsApp AI Sales Agent (Supabase Multi-Tenant)", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/", tags=["Health"])
+async def root():
+    """Ruta de verificación de estado para Vercel Serverless."""
+    return {"status": "online", "message": "Servidor WhatsApp AI Sales Agent 100% activo en Vercel con Supabase."}
+
+# =================================================================================
+# 2. INICIALIZACIÓN DE TABLAS EN SUPABASE
+# =================================================================================
+
 async def init_db():
     """Crea la tabla ventas multi-tenant en Supabase PostgreSQL."""
     try:
@@ -361,7 +420,6 @@ async def call_tools(state: AgentState):
     for tool_call in last_message.tool_calls:
         tool_fn = tools_by_name[tool_call["name"]]
         tool_args = dict(tool_call["args"])
-        # Inyectar automáticamente tenant_phone en herramientas si lo aceptan
         if "tenant_phone" in tool_fn.args and "tenant_phone" not in tool_args:
             tool_args["tenant_phone"] = tenant
             
@@ -462,45 +520,6 @@ async def enviar_reporte_diario_discord(tenant_phone: Optional[str] = None):
 
     except Exception as e:
         print(f"❌ Error generando reporte diario: {e}")
-
-
-# --- Servidor FastAPI & Lifespan ---
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global http_client, db_pool, graph
-    http_client = httpx.AsyncClient(
-        timeout=10.0,
-        limits=httpx.Limits(max_keepalive_connections=50, max_connections=200)
-    )
-
-    # Pool de conexiones asíncronas a Supabase PostgreSQL
-    try:
-        db_pool = AsyncConnectionPool(
-            conninfo=DATABASE_URL_RAW,
-            min_size=1,
-            max_size=10,
-            kwargs={"autocommit": True}
-        )
-        await db_pool.open()
-        await init_db()
-
-        # Compilar Grafo con Checkpointer de PostgreSQL
-        checkpointer = AsyncPostgresSaver(db_pool)
-        await checkpointer.setup()
-        graph = workflow.compile(checkpointer=checkpointer)
-    except Exception as e:
-        print(f"⚠️ Error inicializando checkpointer Postgres en Supabase, usando checkpointer sin persistencia: {e}")
-        graph = workflow.compile()
-
-    yield
-
-    if db_pool:
-        await db_pool.close()
-    if http_client:
-        await http_client.aclose()
-
-app = FastAPI(title="WhatsApp AI Sales Agent (Supabase Multi-Tenant)", lifespan=lifespan)
 
 
 # --- Endpoint para Vercel Cron ---
